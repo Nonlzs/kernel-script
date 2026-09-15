@@ -1,5 +1,7 @@
 # kernel-script Agent Guide
 
+[Project Home](https://github.com/lipeilin2006/kernel-script) | [English README](https://github.com/lipeilin2006/kernel-script/blob/main/README.md) | [中文 README](https://github.com/lipeilin2006/kernel-script/blob/main/README_CN.md) | [English Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document.md) | [中文 Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document_CN.md) | [Driver Notes](https://github.com/lipeilin2006/kernel-script/blob/main/ks-driver/README.md)
+
 ## Project Scope
 
 `kernel-script` is a Windows-only Rust workspace with four crates:

@@ -1,5 +1,7 @@
 # Kernel Script Luau API
 
+[项目主页](https://github.com/lipeilin2006/kernel-script) | [English README](https://github.com/lipeilin2006/kernel-script/blob/main/README.md) | [中文 README](https://github.com/lipeilin2006/kernel-script/blob/main/README_CN.md) | [English Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document.md)
+
 本文档描述 `ks-gui` 当前实际注册到 Luau VM 的 API。每个 `scripts/*.lua`
 脚本在独立 Luau VM 中运行，启用 JIT 编译。
 

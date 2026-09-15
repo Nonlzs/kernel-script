@@ -1,5 +1,7 @@
 # ks-driver WDK build notes
 
+[Project Home](https://github.com/lipeilin2006/kernel-script) | [English README](https://github.com/lipeilin2006/kernel-script/blob/main/README.md) | [中文 README](https://github.com/lipeilin2006/kernel-script/blob/main/README_CN.md) | [Agent Guide](https://github.com/lipeilin2006/kernel-script/blob/main/AGENTS.md)
+
 `ks-driver` contains the Rust WDM framework and intentionally keeps the
 structured-exception boundary in `seh_shim.c`. Build that file with MSVC and
 the Windows Driver Kit, then link it into the native driver target. Rust cannot use

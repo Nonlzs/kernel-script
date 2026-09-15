@@ -1,5 +1,7 @@
 # Kernel Script
 
+[项目主页](https://github.com/lipeilin2006/kernel-script) | [English README](https://github.com/lipeilin2006/kernel-script/blob/main/README.md) | [Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document.md) | [中文 Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document_CN.md)
+
 ## 使用方法
 
 1. 将 `ks-launcher.exe`、`ks-driver.sys`、`ks-service.exe` 和 `ks-gui.exe`

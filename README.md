@@ -1,5 +1,7 @@
 # Kernel Script
 
+[Home](https://github.com/lipeilin2006/kernel-script) | [中文 README](https://github.com/lipeilin2006/kernel-script/blob/main/README_CN.md) | [Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document.md) | [中文 Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document_CN.md)
+
 ## Usage
 
 1. Place `ks-launcher.exe`, `ks-driver.sys`, `ks-service.exe`, and `ks-gui.exe`

@@ -1,5 +1,7 @@
 # Kernel Script Luau API
 
+[Home](https://github.com/lipeilin2006/kernel-script) | [English README](https://github.com/lipeilin2006/kernel-script/blob/main/README.md) | [中文 README](https://github.com/lipeilin2006/kernel-script/blob/main/README_CN.md) | [中文 Lua API](https://github.com/lipeilin2006/kernel-script/blob/main/document_CN.md)
+
 This document describes the Luau APIs registered by `ks-gui`. Each `scripts/*.lua`
 script runs in its own Luau VM with JIT compilation enabled.
 
