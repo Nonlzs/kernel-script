@@ -1,11 +1,11 @@
 [package]
-name = "ks-installer"
+name = "ks-launcher"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "ks-installer"
+name = "ks-launcher"
 path = "src/main.rs"
 
 [dependencies]

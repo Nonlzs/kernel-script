@@ -44,6 +44,26 @@ where
     result
 }
 
+/// Runs a callback to completion and returns its wall-clock duration.
+///
+/// Update callbacks intentionally use this path: a slow synchronous IPC call
+/// should be observable in logs, but must not be interrupted halfway through
+/// a script state transition.
+pub fn call_unbudgeted<A>(lua: &Lua, name: &str, args: A) -> mlua::Result<Duration>
+where
+    A: IntoLuaMulti,
+{
+    let callback = lua.globals().get::<Option<Function>>(name)?;
+    let Some(callback) = callback else {
+        return Ok(Duration::ZERO);
+    };
+
+    let started = Instant::now();
+    let result = callback.call::<()>(args);
+    let elapsed = started.elapsed();
+    result.map(|()| elapsed)
+}
+
 pub fn set_deadline(deadline: &AtomicU64, budget: Option<Duration>) {
     let value = budget.map_or(0, deadline_us);
     deadline.store(value, Ordering::Relaxed);

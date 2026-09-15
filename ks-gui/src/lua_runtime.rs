@@ -8,10 +8,9 @@ use egui;
 use mlua::{Function, Lua, Table, Value};
 
 mod execution;
-mod scheduler;
 mod types;
 
-use scheduler::{FixedUpdateScheduler, RuntimeControl};
+use types::RuntimeControl;
 pub use types::{DrawCommand, DrawCommands};
 
 static CONTENT_SCALE: AtomicU32 = AtomicU32::new(100);
@@ -22,24 +21,21 @@ pub fn set_content_scale(scale: f32) {
 
 use types::Address;
 
-// Lua OnUpdate targets 60 updates per second (16.667 ms per step).
-const UPDATE_STEP: Duration = Duration::from_nanos(16_666_667);
-const MAX_UPDATE_STEPS_PER_FRAME: usize = 4;
 const MAX_FRAME_DELTA: Duration = Duration::from_millis(250);
 const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const START_BUDGET: Duration = Duration::from_millis(100);
 const UPDATE_BUDGET: Duration = Duration::from_millis(20);
-const RENDER_BUDGET: Duration = Duration::from_millis(12);
 const DESTROY_BUDGET: Duration = Duration::from_millis(50);
+const UPDATE_HEALTHY_FRAMES_TO_CLEAR_ERROR: u32 = 30;
 
 pub struct LuaRuntime {
     lua: Lua,
     script_path: PathBuf,
     control: Arc<RuntimeControl>,
     deadline: Arc<AtomicU64>,
-    scheduler: FixedUpdateScheduler,
     last_error: Option<String>,
+    consecutive_healthy_updates: u32,
     last_tick: Instant,
     last_reload_poll: Instant,
     script_modified: Option<SystemTime>,
@@ -121,21 +117,16 @@ impl LuaRuntime {
             script_path,
             control,
             deadline,
-            scheduler: FixedUpdateScheduler::new(
-                UPDATE_STEP,
-                MAX_FRAME_DELTA,
-                MAX_UPDATE_STEPS_PER_FRAME,
-            ),
             last_error: None,
+            consecutive_healthy_updates: 0,
             last_tick: now,
             last_reload_poll: now,
         })
     }
 
-    pub fn frame(&mut self, ctx: &egui::Context, now: Instant) {
+    fn frame(&mut self, ctx: &egui::Context, now: Instant) {
         self.check_hot_reload(now);
-        self.run_updates(now);
-        self.render(ctx);
+        self.run_updates(ctx, now);
         if let Err(error) = self.lua.gc_step() {
             self.last_error = Some(format!("Lua GC error: {error}"));
         }
@@ -173,35 +164,48 @@ impl LuaRuntime {
         Ok((lua, deadline))
     }
 
-    fn run_updates(&mut self, now: Instant) {
+    fn run_updates(&mut self, ctx: &egui::Context, now: Instant) {
         let elapsed = now.duration_since(self.last_tick);
         self.last_tick = now;
 
-        let steps = scheduler::update_steps(&mut self.scheduler, &self.control, elapsed);
-
-        for _ in 0..steps {
-            if let Err(error) = execution::call_budgeted(
-                &self.lua,
-                &self.deadline,
-                "OnUpdate",
-                UPDATE_STEP.as_secs_f32(),
-                UPDATE_BUDGET,
-            ) {
-                self.last_error = Some(format!("OnUpdate failed: {error}"));
-                self.scheduler.reset();
-                break;
-            }
-        }
-    }
-
-    fn render(&mut self, ctx: &egui::Context) {
         let result = self.lua.scope(|scope| {
             let module = create_ui_module(&self.lua, scope, ctx)?;
             self.lua.globals().set("ui", module)?;
-            execution::call_budgeted(&self.lua, &self.deadline, "OnRender", (), RENDER_BUDGET)
+            let dt = if self.control.paused.load(Ordering::Relaxed) {
+                0.0
+            } else {
+                elapsed.min(MAX_FRAME_DELTA).as_secs_f32()
+            };
+            match execution::call_unbudgeted(&self.lua, "OnUpdate", dt) {
+                Ok(callback_elapsed) => {
+                    self.consecutive_healthy_updates =
+                        self.consecutive_healthy_updates.saturating_add(1);
+                    if callback_elapsed > UPDATE_BUDGET {
+                        tracing::warn!(
+                            script = %self.script_path.display(),
+                            elapsed_us = callback_elapsed.as_micros() as u64,
+                            budget_us = UPDATE_BUDGET.as_micros() as u64,
+                            "Lua OnUpdate exceeded advisory budget"
+                        );
+                    }
+                    if self.consecutive_healthy_updates >= UPDATE_HEALTHY_FRAMES_TO_CLEAR_ERROR
+                        && self
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|error| error.starts_with("OnUpdate failed:"))
+                    {
+                        self.last_error = None;
+                    }
+                }
+                Err(error) => {
+                    self.consecutive_healthy_updates = 0;
+                    self.last_error = Some(format!("OnUpdate failed: {error}"));
+                }
+            }
+            Ok::<(), mlua::Error>(())
         });
         if let Err(error) = result {
-            self.last_error = Some(format!("OnRender failed: {error}"));
+            self.last_error = Some(format!("OnUpdate failed: {error}"));
         }
 
         if let Some(error) = self.last_error.clone() {
@@ -249,7 +253,7 @@ impl LuaRuntime {
                 self.lua = new_lua;
                 self.deadline = new_deadline;
                 self.last_error = None;
-                self.scheduler.reset();
+                self.consecutive_healthy_updates = 0;
                 self.last_tick = Instant::now();
                 self.script_modified = script_modified(&self.script_path);
             }
@@ -288,14 +292,6 @@ fn register_engine_api(lua: &Lua, control: Arc<RuntimeControl>) -> mlua::Result<
         "resume",
         lua.create_function(move |_, ()| {
             resume.paused.store(false, Ordering::Relaxed);
-            Ok(())
-        })?,
-    )?;
-    module.set(
-        "step",
-        lua.create_function(move |_, ()| {
-            control.paused.store(true, Ordering::Relaxed);
-            control.pending_steps.store(1, Ordering::Relaxed);
             Ok(())
         })?,
     )?;

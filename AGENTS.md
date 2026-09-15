@@ -8,11 +8,11 @@
 - `ks-driver`: `no_std` WDM kernel driver. It performs target-process memory reads and writes.
 - `ks-service`: SYSTEM user-mode service. It owns the TCP IPC server, driver handle, driver request dispatch, and user-mode process enumeration.
 - `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the Lua VM, synchronous Named Pipe IPC client, and draw command pipeline.
-- `ks-installer`: elevated egui GUI that manages the driver and service with `sc.exe` commands only.
+- `ks-launcher`: elevated egui GUI with ordered `Start Driver`, `Start Service`, and `Start GUI` actions.
 
-`ks-installer` is an elevated egui GUI that manages the driver and backend
-service with `sc.exe` only (`create`/`start`/`stop`/`delete`). It copies no
-files; driver, service, GUI, and installer must sit in the same directory.
+`ks-launcher` uses `sc.exe` to start the driver and service, then launches the
+GUI. It performs no file installation or copying; all errors and command output
+are written to its log file.
 
 The intended data flow is:
 
@@ -47,15 +47,14 @@ The GUI frame lifecycle is:
 
 ```text
 check_hot_reload
-    -> OnUpdate
-    -> OnRender
+    -> OnUpdate (calculation, IPC, UI, drawing)
     -> Lua GC
 ```
 
 Rules:
 
-- `OnRender` must only draw UI and read cached results.
-- `OnUpdate` may perform synchronous memory operations (~60-100μs each).
+- `OnUpdate` is the only per-frame Lua callback and runs once per GUI frame. It performs calculations,
+  optional synchronous memory operations, UI calls, and drawing.
 - All memory API calls are synchronous and block the Lua thread for ~60-100μs.
 - Hot reload destroys the old Lua VM.
 - Multiple Lua scripts are loaded from `scripts/*.lua`; they run on the GUI Lua thread.

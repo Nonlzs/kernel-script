@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 mod app;
+mod overlay;
 
 mod lua_runtime;
 

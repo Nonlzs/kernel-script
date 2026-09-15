@@ -1328,7 +1328,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ks-installer"
+name = "ks-launcher"
 version = "0.1.0"
 dependencies = [
  "eframe",

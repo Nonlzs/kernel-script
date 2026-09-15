@@ -14,9 +14,6 @@ end
 function OnUpdate(delta_time)
 end
 
-function OnRender()
-end
-
 function OnDestroy()
 end
 ```
@@ -24,8 +21,8 @@ end
 Notes:
 
 - `OnStart` is called once after the script is loaded.
-- `OnUpdate` is called during the logic tick phase (60 Hz).
-- `OnRender` is called during the GUI render phase.
+- `OnUpdate` is the only per-frame callback and is called once for each GUI frame.
+- UI and draw APIs are available during `OnUpdate`.
 - `OnDestroy` is called on hot-reload or GUI exit.
 - All memory API calls are synchronous and block the Lua thread for ~60-100μs.
 - Do not call memory APIs inside `ui.window` callbacks if latency is critical.
@@ -298,7 +295,7 @@ Constraints: requires `pid` as a positive integer.
 ## Draw API
 
 Draw commands render on the transparent fullscreen overlay window. All draw
-calls must be made inside `OnRender`. Coordinates are in egui logical points
+calls must be made inside `OnUpdate`. Coordinates are in egui logical points
 (physical pixels divided by `content_scale`).
 
 Colors are RGBA bytes (`0..255`).
@@ -353,7 +350,7 @@ draw.text(x, y, "Hello", r, g, b, a, size)
 
 ## egui UI API
 
-UI APIs are called inside `OnRender`. The GUI uses `egui_overlay` with GLFW
+UI APIs are called inside `OnUpdate`. The GUI uses `egui_overlay` with GLFW
 window and `glow` OpenGL backend for transparent fullscreen overlay rendering.
 
 ### ui.window
@@ -542,9 +539,6 @@ local state = {
 
 function OnUpdate(dt)
     -- All memory calls are synchronous (~60-100μs each)
-end
-
-function OnRender()
     ui.window("Kernel Script", function()
         if ui.button("Attach") then
             state.pid = memory.get_pid(state.process_name)
@@ -596,7 +590,7 @@ can comfortably fit 100+ synchronous memory reads per frame.
 - Process list is enumerated in user mode by the service.
 - Memory read/write and RVA computation are performed by the driver.
 - Window rect enumeration runs in the GUI process (user session).
-- Draw commands must be called inside `OnRender`.
+- Draw commands must be called inside `OnUpdate`.
 - Coordinates are in egui logical points; divide physical pixels by
   `content_scale` for correct overlay alignment.
 - Transport uses the `\\.\pipe\KernelScript` Named Pipe.

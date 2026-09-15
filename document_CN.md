@@ -14,9 +14,6 @@ end
 function OnUpdate(delta_time)
 end
 
-function OnRender()
-end
-
 function OnDestroy()
 end
 ```
@@ -24,8 +21,8 @@ end
 说明：
 
 - `OnStart` 在脚本加载后调用一次。
-- `OnUpdate` 在逻辑刷新阶段调用（60 Hz）。
-- `OnRender` 在 GUI 渲染阶段调用。
+- `OnUpdate` 是唯一的每帧回调，每个 GUI 帧调用一次。
+- UI 和 draw API 都在 `OnUpdate` 中使用。
 - `OnDestroy` 在热重载或 GUI 退出时调用。
 - 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
 - 如果延迟敏感，不要在 `ui.window` 回调中调用内存 API。
@@ -290,7 +287,7 @@ end
 
 ## Draw API
 
-Draw 命令在透明全屏覆盖窗口上渲染。所有 draw 调用必须在 `OnRender` 中
+Draw 命令在透明全屏覆盖窗口上渲染。所有 draw 调用必须在 `OnUpdate` 中
 执行。坐标单位为 egui 逻辑点（物理像素除以 `content_scale`）。
 
 颜色为 RGBA 字节（`0..255`）。
@@ -345,7 +342,7 @@ draw.text(x, y, "你好", r, g, b, a, size)
 
 ## egui UI API
 
-Lua UI API 在 `OnRender` 中使用。GUI 当前使用 `egui_overlay` + GLFW 窗口 +
+Lua UI API 在 `OnUpdate` 中使用。GUI 当前使用 `egui_overlay` + GLFW 窗口 +
 `glow` OpenGL backend 实现透明全屏覆盖层渲染。
 
 ### ui.window
@@ -537,9 +534,6 @@ local state = {
 
 function OnUpdate(dt)
     -- 所有内存调用都是同步的（每次约 60-100μs）
-end
-
-function OnRender()
     ui.window("Kernel Script", function()
         if ui.button("附加") then
             state.pid = memory.get_pid(state.process_name)
@@ -589,7 +583,7 @@ GUI 到 service 的 IPC 使用同步阻塞 Named Pipe 调用：
 - 进程列表由 service 在用户态枚举。
 - 内存读写和 RVA 计算由 driver 执行。
 - 窗口枚举在 GUI 进程（用户会话）中执行。
-- Draw 命令必须在 `OnRender` 中调用。
+- Draw 命令必须在 `OnUpdate` 中调用。
 - 坐标单位为 egui 逻辑点；物理像素需除以 `content_scale` 才能正确对齐。
 - 服务传输使用 `\\.\pipe\KernelScript` Named Pipe。
 - Named Pipe 和 driver device 的权限由 Windows 安全描述符控制。

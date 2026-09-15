@@ -1,5 +1,24 @@
 # Kernel Script
 
+## Usage
+
+1. Place `ks-launcher.exe`, `ks-driver.sys`, `ks-service.exe`, and `ks-gui.exe`
+   in the same directory.
+2. Run `ks-launcher.exe` as administrator.
+3. Click `Start Driver`.
+4. After the driver is running, click `Start Service`.
+5. After the service is running, click `Start GUI`.
+6. To shut down, use `Stop GUI`, then `Stop Service`, then `Stop Driver`.
+
+The launcher recreates the driver and service registrations from the files next
+to the launcher before starting them. Green/normal buttons are used for start
+actions; running components show red `Stop ...` buttons. All command output and
+errors are written to `ks-launcher.log` beside the launcher.
+
+For manual service diagnostics, run `ks-service.exe --console` from an elevated
+terminal. The GUI requires an interactive desktop session because it uses
+GLFW/OpenGL.
+
 Kernel Script is a Windows-only Rust workspace for running Luau scripts over a
 protected user-mode service and WDM driver. The project is split into four
 runtime layers:
@@ -49,11 +68,12 @@ kernel-script/
 │   └── src/
 │       ├── app.rs               # overlay application and frame rendering
 │       ├── lua_runtime.rs       # Lua VM lifecycle and API registration
-│       ├── lua_runtime/         # execution, scheduler, and runtime types
+│       ├── lua_runtime/         # execution and runtime types
+│       ├── overlay.rs            # generic draw-command painter bridge
 │       ├── sync_ipc.rs          # synchronous Named Pipe client
 │       └── window_util.rs       # target-window geometry lookup
-├── ks-installer/
-│   └── src/main.rs              # elevated sc.exe service manager
+├── ks-launcher/
+│   └── src/main.rs              # elevated three-step launcher
 └── ks-test/
     └── src/main.rs              # standalone IPC benchmark client
 ```
@@ -65,15 +85,14 @@ Each `.lua` file loaded by the GUI runs in its own Luau VM:
 ```lua
 function OnStart() end
 function OnUpdate(dt) end
-function OnRender() end
 function OnDestroy() end
 ```
 
 - `OnStart` runs once after loading.
-- `OnUpdate` runs on the fixed logic scheduler and may perform synchronous memory
-  operations.
-- `OnRender` should draw UI and consume cached state. Do not put repeated
-  blocking IPC work in UI callbacks.
+- `OnUpdate` is the only per-frame callback. It runs once per GUI frame and performs calculations, optional
+  synchronous memory operations, UI calls, and drawing in one Lua invocation.
+- The callback runs on the GUI Lua thread; long synchronous IPC still delays the
+  next frame, so scripts should keep work bounded.
 - `OnDestroy` runs during hot reload and shutdown.
 
 All memory functions are synchronous and execute on the GUI Lua thread. See
@@ -126,8 +145,9 @@ window station. Lua scripts are loaded from the `scripts` directory beside the
 GUI executable. Files whose stem begins with `_` are kept available for manual
 testing but are not loaded by default.
 
-The installer only manages service registration with `sc.exe`; it does not
-copy source files or manage build artifacts.
+The launcher provides three ordered actions: `Start Driver`, `Start Service`,
+and `Start GUI`. Later actions remain disabled until earlier actions are
+running. Errors and command output are written to `ks-launcher.log`.
 
 ## Security Boundaries
 

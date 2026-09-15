@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use mlua::{FromLua, Lua, Value};
@@ -82,11 +82,4 @@ impl FromLua for Address {
 #[derive(Default)]
 pub struct RuntimeControl {
     pub paused: AtomicBool,
-    pub pending_steps: AtomicUsize,
-}
-
-impl RuntimeControl {
-    pub fn consume_manual_step(&self) -> usize {
-        self.pending_steps.swap(0, Ordering::Relaxed).min(1)
-    }
 }
