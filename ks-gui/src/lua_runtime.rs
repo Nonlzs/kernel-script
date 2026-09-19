@@ -7,9 +7,11 @@ use std::time::{Duration, Instant, SystemTime};
 use egui;
 use mlua::{Function, Lua, Table, Value};
 
+mod engine_api;
 mod execution;
 mod types;
 
+use crate::config_store::SharedConfigStore;
 use types::RuntimeControl;
 pub use types::{DrawCommand, DrawCommands};
 
@@ -21,6 +23,10 @@ pub fn set_content_scale(scale: f32) {
 
 use types::Address;
 
+// The whole overlay (render + OnUpdate) is capped at 100 frames per second by
+// the repaint interval in app.rs. OnUpdate runs once per rendered frame, which
+// keeps immediate-mode egui windows stable; a slow callback simply lowers the
+// achieved frequency.
 const MAX_FRAME_DELTA: Duration = Duration::from_millis(250);
 const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
@@ -28,6 +34,9 @@ const START_BUDGET: Duration = Duration::from_millis(100);
 const UPDATE_BUDGET: Duration = Duration::from_millis(20);
 const DESTROY_BUDGET: Duration = Duration::from_millis(50);
 const UPDATE_HEALTHY_FRAMES_TO_CLEAR_ERROR: u32 = 30;
+
+/// Overlay frame interval: the maximum GUI frame rate (100 Hz).
+pub const FRAME_INTERVAL: Duration = Duration::from_nanos(10_000_000);
 
 pub struct LuaRuntime {
     lua: Lua,
@@ -40,16 +49,25 @@ pub struct LuaRuntime {
     last_reload_poll: Instant,
     script_modified: Option<SystemTime>,
     draw_commands: DrawCommands,
+    config: SharedConfigStore,
 }
 
 pub struct LuaRuntimeManager {
     runtimes: Vec<LuaRuntime>,
     draw_commands: DrawCommands,
+    config: SharedConfigStore,
 }
 
 impl LuaRuntimeManager {
     pub fn new(script_directory: PathBuf) -> mlua::Result<Self> {
         let draw_commands: DrawCommands = Arc::new(Mutex::new(Vec::new()));
+        // config.json lives beside the executable (scripts/<dir>/..). The
+        // store is manager-owned so it survives per-script hot reloads.
+        let config = crate::config_store::ConfigStore::shared(
+            script_directory
+                .parent()
+                .unwrap_or(script_directory.as_path()),
+        );
         let mut paths = fs::read_dir(&script_directory)
             .map_err(mlua::Error::external)?
             .filter_map(Result::ok)
@@ -70,24 +88,28 @@ impl LuaRuntimeManager {
         }
         let runtimes = paths
             .into_iter()
-            .map(|path| LuaRuntime::new(path, Arc::clone(&draw_commands)))
+            .map(|path| LuaRuntime::new(path, Arc::clone(&draw_commands), Arc::clone(&config)))
             .collect::<mlua::Result<Vec<_>>>()?;
         Ok(Self {
             runtimes,
             draw_commands,
+            config,
         })
     }
 
-    pub fn frame(&mut self, ctx: &egui::Context, now: Instant) {
+    pub fn frame(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
+        // Every rendered frame runs OnUpdate (immediate-mode egui requires it)
+        // and regenerates the draw command snapshot.
         self.draw_commands.lock().unwrap().clear();
         for runtime in &mut self.runtimes {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.frame(ctx, now);
+                runtime.frame(ctx, now, ui_visible);
             }));
             if result.is_err() {
                 runtime.set_error("Lua runtime panicked; script disabled until reload".to_owned());
             }
         }
+        self.config.lock().unwrap().flush_if_due();
     }
 
     pub fn set_error(&mut self, error: String) {
@@ -102,12 +124,17 @@ impl LuaRuntimeManager {
 }
 
 impl LuaRuntime {
-    fn new(script_path: PathBuf, draw_commands: DrawCommands) -> mlua::Result<Self> {
+    fn new(
+        script_path: PathBuf,
+        draw_commands: DrawCommands,
+        config: SharedConfigStore,
+    ) -> mlua::Result<Self> {
         let control = Arc::new(RuntimeControl::default());
         let (lua, deadline) = Self::build_vm(
             &script_path,
             Arc::clone(&control),
             Arc::clone(&draw_commands),
+            Arc::clone(&config),
         )?;
         let now = Instant::now();
         Ok(Self {
@@ -121,12 +148,13 @@ impl LuaRuntime {
             consecutive_healthy_updates: 0,
             last_tick: now,
             last_reload_poll: now,
+            config,
         })
     }
 
-    fn frame(&mut self, ctx: &egui::Context, now: Instant) {
+    fn frame(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
         self.check_hot_reload(now);
-        self.run_updates(ctx, now);
+        self.run_updates(ctx, now, ui_visible);
         if let Err(error) = self.lua.gc_step() {
             self.last_error = Some(format!("Lua GC error: {error}"));
         }
@@ -140,6 +168,7 @@ impl LuaRuntime {
         script_path: &Path,
         control: Arc<RuntimeControl>,
         draw_commands: DrawCommands,
+        config: SharedConfigStore,
     ) -> mlua::Result<(Lua, Arc<AtomicU64>)> {
         let lua = Lua::new();
         lua.set_memory_limit(LUA_MEMORY_LIMIT)?;
@@ -148,9 +177,10 @@ impl LuaRuntime {
             lua.globals().set(global, Value::Nil)?;
         }
         let deadline = execution::install_hook(&lua);
-        register_engine_api(&lua, control)?;
+        engine_api::register(&lua, control)?;
         register_memory_api(&lua)?;
         register_draw_api(&lua, draw_commands)?;
+        register_config_api(&lua, config)?;
 
         let source = fs::read_to_string(script_path).map_err(mlua::Error::external)?;
         execution::set_deadline(&deadline, Some(START_BUDGET));
@@ -164,12 +194,15 @@ impl LuaRuntime {
         Ok((lua, deadline))
     }
 
-    fn run_updates(&mut self, ctx: &egui::Context, now: Instant) {
+    fn run_updates(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
         let elapsed = now.duration_since(self.last_tick);
         self.last_tick = now;
 
+        // OnUpdate runs once per rendered frame. The dt is the real frame
+        // interval; a slow callback simply stretches it and lowers the
+        // achieved frequency. Budget overruns are advisory warnings only.
         let result = self.lua.scope(|scope| {
-            let module = create_ui_module(&self.lua, scope, ctx)?;
+            let module = create_ui_module(&self.lua, scope, ctx, ui_visible)?;
             self.lua.globals().set("ui", module)?;
             let dt = if self.control.paused.load(Ordering::Relaxed) {
                 0.0
@@ -239,6 +272,7 @@ impl LuaRuntime {
             &self.script_path,
             Arc::clone(&self.control),
             Arc::clone(&self.draw_commands),
+            Arc::clone(&self.config),
         ) {
             Ok((new_lua, new_deadline)) => {
                 if let Err(error) = execution::call_budgeted(
@@ -272,40 +306,6 @@ impl Drop for LuaRuntime {
     }
 }
 
-fn register_engine_api(lua: &Lua, control: Arc<RuntimeControl>) -> mlua::Result<()> {
-    let module = lua.create_table()?;
-    let paused = Arc::clone(&control);
-    module.set(
-        "is_paused",
-        lua.create_function(move |_, ()| Ok(paused.paused.load(Ordering::Relaxed)))?,
-    )?;
-    let pause = Arc::clone(&control);
-    module.set(
-        "pause",
-        lua.create_function(move |_, ()| {
-            pause.paused.store(true, Ordering::Relaxed);
-            Ok(())
-        })?,
-    )?;
-    let resume = Arc::clone(&control);
-    module.set(
-        "resume",
-        lua.create_function(move |_, ()| {
-            resume.paused.store(false, Ordering::Relaxed);
-            Ok(())
-        })?,
-    )?;
-    module.set(
-        "memory_used",
-        lua.create_function(|lua, ()| Ok(lua.used_memory()))?,
-    )?;
-    module.set(
-        "time_us",
-        lua.create_function(|_, ()| -> mlua::Result<u64> { Ok(execution::time_us()) })?,
-    )?;
-    lua.globals().set("engine", module)
-}
-
 fn script_modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
@@ -328,10 +328,35 @@ fn with_egui_ui<R>(
     Ok(unsafe { draw(&mut *pointer) })
 }
 
+/// Runs `draw` against a nested Ui (the child Ui handed out by container
+/// widgets such as CollapsingHeader or ScrollArea) for the duration of the
+/// call, then restores the previous bridge target. Without the swap, Lua body
+/// callbacks would draw into the parent Ui and overlap surrounding content.
+fn with_egui_ui_swapped<R>(
+    bridge: &Mutex<usize>,
+    nested: &mut egui::Ui,
+    draw: impl FnOnce(&mut egui::Ui) -> R,
+) -> Result<R, mlua::Error> {
+    let previous = {
+        let mut guard = bridge
+            .lock()
+            .map_err(|_| mlua::Error::runtime("egui bridge lock poisoned"))?;
+        let previous = *guard;
+        *guard = nested as *mut egui::Ui as usize;
+        previous
+    };
+    let result = with_egui_ui(bridge, draw);
+    if let Ok(mut guard) = bridge.lock() {
+        *guard = previous;
+    }
+    result
+}
+
 fn create_ui_module<'scope>(
     lua: &Lua,
     scope: &'scope mlua::Scope<'scope, '_>,
     ctx: &'scope egui::Context,
+    ui_visible: bool,
 ) -> mlua::Result<Table> {
     let module = lua.create_table()?;
     let bridge = Arc::new(Mutex::new(0usize));
@@ -339,6 +364,12 @@ fn create_ui_module<'scope>(
     module.set(
         "window",
         scope.create_function(move |_, (title, body): (String, Function)| {
+            // While the script UI is hidden the window body is skipped entirely:
+            // OnUpdate keeps running so draw.* overlay output is unaffected, and
+            // scripts never observe a missing ui.window function.
+            if !ui_visible {
+                return Ok(());
+            }
             let callback_error = std::cell::RefCell::new(None);
             egui::Window::new(title).show(ctx, |ui| {
                 *bridge_for_window.lock().unwrap() = ui as *mut egui::Ui as usize;
@@ -557,8 +588,10 @@ fn create_ui_module<'scope>(
                 with_egui_ui(&bridge, |ui| {
                     egui::CollapsingHeader::new(&title)
                         .default_open(false)
-                        .show(ui, |_ui| {
-                            if let Err(error) = body.call::<()>(()) {
+                        .show(ui, |inner_ui| {
+                            if let Err(error) =
+                                with_egui_ui_swapped(&bridge, inner_ui, |_ui| body.call::<()>(()))
+                            {
                                 *callback_error.borrow_mut() = Some(error);
                             }
                         });
@@ -581,8 +614,10 @@ fn create_ui_module<'scope>(
                 with_egui_ui(&bridge, |ui| {
                     egui::ScrollArea::vertical()
                         .max_height(height.max(32.0))
-                        .show(ui, |_ui| {
-                            if let Err(error) = body.call::<()>(()) {
+                        .show(ui, |inner_ui| {
+                            if let Err(error) =
+                                with_egui_ui_swapped(&bridge, inner_ui, |_ui| body.call::<()>(()))
+                            {
                                 *callback_error.borrow_mut() = Some(error);
                             }
                         });
@@ -1039,6 +1074,43 @@ fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     module.set(
+        "lock",
+        lua.create_function(|_, (pid, address, data): (u64, Address, Vec<u8>)| {
+            if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
+                return Err(mlua::Error::runtime("invalid lock size"));
+            }
+            crate::sync_ipc::lock(pid, address.get(), &data).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "unlock",
+        lua.create_function(|_, (pid, address): (u64, Address)| {
+            crate::sync_ipc::unlock(pid, address.get()).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "unlock_all",
+        lua.create_function(|_, pid: u64| {
+            crate::sync_ipc::unlock_all(pid).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "lock_rva",
+        lua.create_function(|_, (pid, relative_address, data): (u64, u64, Vec<u8>)| {
+            if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
+                return Err(mlua::Error::runtime("invalid lock size"));
+            }
+            crate::sync_ipc::lock_rva(pid, relative_address, &data).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    module.set(
+        "unlock_rva",
+        lua.create_function(|_, (pid, relative_address): (u64, u64)| {
+            crate::sync_ipc::unlock_rva(pid, relative_address).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+
+    module.set(
         "get_window_rect",
         lua.create_function(|lua, pid: u64| -> mlua::Result<Option<mlua::Table>> {
             let pid32 = u32::try_from(pid).map_err(|_| mlua::Error::runtime("PID too large"))?;
@@ -1061,6 +1133,104 @@ fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     lua.globals().set("memory", module)
+}
+
+/// Converts a Lua value into a storable config entry. Only JSON-mappable
+/// scalars are accepted; tables, functions and userdata are rejected.
+fn config_value_from_lua(value: &Value) -> Option<crate::config_store::ConfigValue> {
+    use crate::config_store::ConfigValue;
+    match value {
+        Value::Boolean(flag) => Some(ConfigValue::Bool(*flag)),
+        Value::Integer(int) => Some(ConfigValue::Int(*int)),
+        Value::Number(number) => Some(ConfigValue::Float(*number)),
+        Value::String(text) => text
+            .to_str()
+            .ok()
+            .map(|text| ConfigValue::Str(text.to_owned())),
+        _ => None,
+    }
+}
+
+fn config_value_into_lua(lua: &Lua, value: crate::config_store::ConfigValue) -> Value {
+    use crate::config_store::ConfigValue;
+    match value {
+        ConfigValue::Bool(flag) => Value::Boolean(flag),
+        ConfigValue::Int(int) => Value::Integer(int),
+        // Non-finite floats cannot be represented in JSON; surface nil instead
+        // of letting the flush fail on serialization.
+        ConfigValue::Float(float) if float.is_finite() => Value::Number(float),
+        ConfigValue::Float(_) => Value::Nil,
+        ConfigValue::Str(text) => match lua.create_string(text.as_bytes()) {
+            Ok(string) => Value::String(string),
+            Err(_) => Value::Nil,
+        },
+    }
+}
+
+fn register_config_api(
+    lua: &Lua,
+    config: crate::config_store::SharedConfigStore,
+) -> mlua::Result<()> {
+    let module = lua.create_table()?;
+
+    // config.set(key, value) -> bool
+    // Accepts boolean, integer, number or string values. Returns false for
+    // unsupported types or oversized keys/values; the entry is only queued in
+    // memory and written to config.json by the debounced flush.
+    {
+        let config = Arc::clone(&config);
+        module.set(
+            "set",
+            lua.create_function(move |_, (key, value): (String, Value)| {
+                let Some(entry) = config_value_from_lua(&value) else {
+                    return Ok(false);
+                };
+                Ok(config.lock().unwrap().set(&key, entry))
+            })?,
+        )?;
+    }
+
+    // config.get(key, default?) -> value
+    // Returns the stored entry, or `default` (nil when omitted) when missing.
+    {
+        let config = Arc::clone(&config);
+        module.set(
+            "get",
+            lua.create_function(move |lua, (key, default): (String, Option<Value>)| {
+                let stored = config
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .map(|entry| config_value_into_lua(lua, entry));
+                Ok(stored.unwrap_or_else(|| default.unwrap_or(Value::Nil)))
+            })?,
+        )?;
+    }
+
+    // config.remove(key) -> bool
+    {
+        let config = Arc::clone(&config);
+        module.set(
+            "remove",
+            lua.create_function(move |_, key: String| Ok(config.lock().unwrap().remove(&key)))?,
+        )?;
+    }
+
+    // config.save() -> bool
+    // Forces an immediate write of the pending changes to config.json.
+    {
+        let config = Arc::clone(&config);
+        module.set(
+            "save",
+            lua.create_function(move |_, ()| {
+                let mut store = config.lock().unwrap();
+                store.flush();
+                Ok(!store.is_dirty())
+            })?,
+        )?;
+    }
+
+    lua.globals().set("config", module)
 }
 
 fn register_draw_api(lua: &Lua, draw_commands: DrawCommands) -> mlua::Result<()> {
@@ -1230,17 +1400,6 @@ fn register_draw_api(lua: &Lua, draw_commands: DrawCommands) -> mlua::Result<()>
 
 // Coroutine suspension happens entirely on the Lua thread. The IPC worker
 // only produces task results, so no Lua object crosses a thread boundary.
-fn parse_address(value: &str) -> mlua::Result<Address> {
-    let value = value.trim();
-    let (digits, radix) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .map_or((value, 10), |digits| (digits, 16));
-    let address = u64::from_str_radix(digits, radix).map_err(|_| {
-        mlua::Error::runtime("address must be a valid u64 decimal or 0x hexadecimal value")
-    })?;
-    Ok(Address::new(address))
-}
 
 #[cfg(test)]
 mod tests {
@@ -1249,15 +1408,15 @@ mod tests {
     #[test]
     fn parses_decimal_and_hex_addresses_without_float_conversion() {
         assert_eq!(
-            parse_address("140702365450240").unwrap().get(),
+            engine_api::parse_address("140702365450240").unwrap().get(),
             140702365450240
         );
         assert_eq!(
-            parse_address("0x7FF812345000").unwrap().get(),
+            engine_api::parse_address("0x7FF812345000").unwrap().get(),
             0x7FF8_1234_5000
         );
-        assert_eq!(parse_address("0").unwrap().get(), 0);
-        assert!(parse_address("not-an-address").is_err());
+        assert_eq!(engine_api::parse_address("0").unwrap().get(), 0);
+        assert!(engine_api::parse_address("not-an-address").is_err());
     }
 
     #[test]

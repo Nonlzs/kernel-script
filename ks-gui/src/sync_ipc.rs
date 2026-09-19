@@ -9,6 +9,7 @@ use ks_core::protocol::{
 
 struct SyncPipe {
     handle: windows_sys::Win32::Foundation::HANDLE,
+    request_buffer: Vec<u8>,
 }
 
 unsafe impl Send for SyncPipe {}
@@ -37,22 +38,29 @@ impl SyncPipe {
             return Err("failed to open pipe".into());
         }
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            request_buffer: Vec::with_capacity(MAX_FRAME_SIZE.min(4096)),
+        })
     }
 
     fn write_all(&self, data: &[u8]) -> Result<(), String> {
-        let mut written = 0u32;
-        let ok = unsafe {
-            windows_sys::Win32::Storage::FileSystem::WriteFile(
-                self.handle,
-                data.as_ptr(),
-                data.len() as u32,
-                &mut written,
-                core::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err("write failed".into());
+        let mut total = 0usize;
+        while total < data.len() {
+            let mut written = 0u32;
+            let ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::WriteFile(
+                    self.handle,
+                    data[total..].as_ptr(),
+                    (data.len() - total) as u32,
+                    &mut written,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || written == 0 {
+                return Err("write failed".into());
+            }
+            total += written as usize;
         }
         Ok(())
     }
@@ -80,9 +88,11 @@ impl SyncPipe {
 
     fn send_request(&mut self, request: &Request) -> Result<Vec<u8>, String> {
         let total = request.encoded_len().map_err(|e| format!("{e:?}"))?;
-        let mut frame = vec![0u8; total];
-        request.encode(&mut frame).map_err(|e| format!("{e:?}"))?;
-        self.write_all(&frame)?;
+        self.request_buffer.resize(total, 0);
+        request
+            .encode(&mut self.request_buffer)
+            .map_err(|e| format!("{e:?}"))?;
+        self.write_all(&self.request_buffer)?;
 
         let mut header = [0u8; HEADER_SIZE];
         self.read_exact(&mut header)?;
@@ -90,10 +100,10 @@ impl SyncPipe {
         if payload_len > MAX_FRAME_SIZE - HEADER_SIZE {
             return Err("response too large".into());
         }
-        let mut resp = vec![0u8; HEADER_SIZE + payload_len];
-        resp[..HEADER_SIZE].copy_from_slice(&header);
-        self.read_exact(&mut resp[HEADER_SIZE..])?;
-        Ok(resp)
+        let mut response = vec![0u8; HEADER_SIZE + payload_len];
+        response[..HEADER_SIZE].copy_from_slice(&header);
+        self.read_exact(&mut response[HEADER_SIZE..])?;
+        Ok(response)
     }
 }
 
@@ -321,6 +331,63 @@ pub fn traverse_pointer_chain(pid: u64, base: u64, offsets: &[u64]) -> Result<u6
     match decode_ok(&resp)? {
         Response::PointerChainResult(addr) => Ok(addr),
         Response::Error(code) => Err(format!("service error: {code}")),
+        _ => Err("unexpected response".into()),
+    }
+}
+
+pub fn lock(pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
+    let resp = ipc_send(&Request::LockMemory { pid, address, data })?;
+    match decode_ok(&resp)? {
+        Response::LockComplete => Ok(()),
+        Response::Error(code) => Err(format!("service error: {code}")),
+        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
+        _ => Err("unexpected response".into()),
+    }
+}
+
+pub fn unlock(pid: u64, address: u64) -> Result<(), String> {
+    let resp = ipc_send(&Request::UnlockMemory { pid, address })?;
+    match decode_ok(&resp)? {
+        Response::LockComplete => Ok(()),
+        Response::Error(code) => Err(format!("service error: {code}")),
+        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
+        _ => Err("unexpected response".into()),
+    }
+}
+
+pub fn unlock_all(pid: u64) -> Result<(), String> {
+    let resp = ipc_send(&Request::ClearMemoryLocks { pid })?;
+    match decode_ok(&resp)? {
+        Response::LockComplete => Ok(()),
+        Response::Error(code) => Err(format!("service error: {code}")),
+        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
+        _ => Err("unexpected response".into()),
+    }
+}
+
+pub fn lock_rva(pid: u64, relative_address: u64, data: &[u8]) -> Result<(), String> {
+    let resp = ipc_send(&Request::LockMemoryRva {
+        pid,
+        relative_address,
+        data,
+    })?;
+    match decode_ok(&resp)? {
+        Response::LockComplete => Ok(()),
+        Response::Error(code) => Err(format!("service error: {code}")),
+        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
+        _ => Err("unexpected response".into()),
+    }
+}
+
+pub fn unlock_rva(pid: u64, relative_address: u64) -> Result<(), String> {
+    let resp = ipc_send(&Request::UnlockMemoryRva {
+        pid,
+        relative_address,
+    })?;
+    match decode_ok(&resp)? {
+        Response::LockComplete => Ok(()),
+        Response::Error(code) => Err(format!("service error: {code}")),
+        Response::ErrorDetail(detail) => Err(String::from_utf8_lossy(detail).into_owned()),
         _ => Err("unexpected response".into()),
     }
 }

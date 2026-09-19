@@ -45,6 +45,8 @@ mod win32 {
 struct KernelScriptApp {
     runtime: LuaRuntimeManager,
     fonts_installed: bool,
+    ui_visible: bool,
+    insert_was_down: bool,
 }
 
 impl KernelScriptApp {
@@ -57,6 +59,8 @@ impl KernelScriptApp {
         Ok(Self {
             runtime: LuaRuntimeManager::new(script_dir)?,
             fonts_installed: false,
+            ui_visible: true,
+            insert_was_down: false,
         })
     }
 }
@@ -69,8 +73,27 @@ impl EguiOverlay for KernelScriptApp {
         glfw_backend: &mut GlfwBackend,
     ) {
         // The overlay has no ordinary widget invalidation to drive repainting.
-        // Request every frame so cached ESP data is rendered at display rate.
-        ctx.request_repaint();
+        // Cap the whole overlay (render + OnUpdate) at 100 FPS so egui windows
+        // stay stable and slow Lua callbacks simply lower the frame rate.
+        ctx.request_repaint_after(crate::lua_runtime::FRAME_INTERVAL);
+        // Insert toggles the egui script windows only; Lua keeps running and
+        // the draw.* overlay layer stays visible while the UI is hidden.
+        // GetAsyncKeyState reads the physical key state of the whole desktop,
+        // so the toggle works while another window (the game) owns input
+        // focus and the unfocused overlay never receives key events.
+        let insert_down = unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_INSERT as i32,
+            ) as u16
+                & 0x8000
+                != 0
+        };
+        let toggle_requested = insert_down && !self.insert_was_down;
+        self.insert_was_down = insert_down;
+        if toggle_requested {
+            self.ui_visible = !self.ui_visible;
+            tracing::info!(ui_visible = self.ui_visible, "script UI toggled");
+        }
         if !self.fonts_installed {
             let _ = install_chinese_font(ctx);
             let mut style = (*ctx.style()).clone();
@@ -87,7 +110,7 @@ impl EguiOverlay for KernelScriptApp {
             }
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.runtime.frame(ctx, Instant::now());
+            self.runtime.frame(ctx, Instant::now(), self.ui_visible);
         }));
         if result.is_err() {
             tracing::error!("panic recovered at GUI frame boundary");

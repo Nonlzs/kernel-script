@@ -20,6 +20,9 @@ The implementation is fail-closed:
 - Locked MDLs are unlocked and freed by `LockedMdl` on every return path.
 - `MmProbeAndLockPages` is called only through the MSVC SEH shim.
 - The old CR3/physical-memory access path is not part of this driver.
+- Fixed-size `METHOD_BUFFERED` request views use `zerocopy` after the input
+  length has been validated. Dynamic IPC payloads remain outside the driver
+  and are not decoded with `zerocopy`.
 
 ## Cargo + WDK build
 

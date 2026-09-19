@@ -1,6 +1,10 @@
 //! Wire protocol shared by the driver, service and clients.
 //! All integers are little-endian and no Rust layout is exposed on the wire.
 
+#[path = "message_type.rs"]
+mod message_type;
+pub use message_type::MessageType;
+
 // Existing Windows driver ABI. These are intentionally kept separate from the
 // length-prefixed IPC messages below.
 // CTL_CODE(FILE_DEVICE_UNKNOWN, function, METHOD_BUFFERED, FILE_ANY_ACCESS).
@@ -17,6 +21,8 @@ pub const IOCTL_READ_MEMORY_MDL_RVA: u32 = 0x0022_202C;
 pub const IOCTL_WRITE_MEMORY_MDL_RVA: u32 = 0x0022_2030;
 pub const IOCTL_BATCH_READ_MEMORY: u32 = 0x0022_2034;
 pub const IOCTL_TRAVERSE_POINTER_CHAIN: u32 = 0x0022_2038;
+pub const MAX_MEMORY_LOCK_SIZE: usize = 4096;
+pub const MAX_MEMORY_LOCKS: usize = 64;
 
 #[repr(C)]
 pub struct MemoryReadRequest {
@@ -60,14 +66,13 @@ pub struct MemoryResponse {
     pub error_code: u32,
 }
 
-#[cfg(feature = "alloc")]
-use alloc::vec::Vec;
-
 pub const MAGIC: u32 = 0x4B53_4352; // "KSCR"
 pub const HEADER_SIZE: usize = 10;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 // The Windows driver ABI uses a fixed 4096-byte data area.
 pub const MAX_DRIVER_TRANSFER_SIZE: usize = 4096;
+pub const READ_RESPONSE_HEADER_SIZE: usize = 8;
+pub const READ_RESPONSE_SIZE: usize = READ_RESPONSE_HEADER_SIZE + MAX_DRIVER_TRANSFER_SIZE + 4;
 pub const MAX_PROCESS_LIST_ENTRIES: usize = 4096;
 pub const MAX_PROCESS_NAME_BYTES: usize = 260;
 pub const PROCESS_RECORD_HEADER_SIZE: usize = 26;
@@ -76,63 +81,6 @@ pub const MAX_PROCESS_LIST_SIZE: usize =
 pub const MAX_WRITE_SIZE: usize = MAX_FRAME_SIZE - HEADER_SIZE - 20;
 pub const MAX_BATCH_ENTRIES: usize = 256;
 pub const BATCH_READ_ENTRY_WIRE_SIZE: usize = 12; // address:8 + size:4
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u16)]
-pub enum MessageType {
-    FetchProcessList = 1,
-    ProcessList = 2,
-    ReadProcessMemory = 3,
-    ReadProcessMemoryResponse = 4,
-    WriteProcessMemory = 5,
-    WriteProcessMemoryResponse = 6,
-    GetProcessBase = 9,
-    GetProcessBaseResponse = 10,
-    ReadMemoryRva = 11,
-    WriteMemoryRva = 12,
-    ReadMemoryMdl = 15,
-    WriteMemoryMdl = 16,
-    ReadMemoryMdlRva = 17,
-    WriteMemoryMdlRva = 18,
-    GetProcessId = 7,
-    GetProcessIdResponse = 8,
-    BatchReadMemory = 19,
-    BatchReadMemoryResponse = 20,
-    TraversePointerChain = 21,
-    TraversePointerChainResponse = 22,
-    Error = 0xFFFF,
-    ErrorDetail = 0xFFFE,
-}
-
-impl MessageType {
-    pub fn from_u16(value: u16) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::FetchProcessList),
-            2 => Ok(Self::ProcessList),
-            3 => Ok(Self::ReadProcessMemory),
-            4 => Ok(Self::ReadProcessMemoryResponse),
-            5 => Ok(Self::WriteProcessMemory),
-            6 => Ok(Self::WriteProcessMemoryResponse),
-            9 => Ok(Self::GetProcessBase),
-            10 => Ok(Self::GetProcessBaseResponse),
-            11 => Ok(Self::ReadMemoryRva),
-            12 => Ok(Self::WriteMemoryRva),
-            15 => Ok(Self::ReadMemoryMdl),
-            16 => Ok(Self::WriteMemoryMdl),
-            17 => Ok(Self::ReadMemoryMdlRva),
-            18 => Ok(Self::WriteMemoryMdlRva),
-            7 => Ok(Self::GetProcessId),
-            8 => Ok(Self::GetProcessIdResponse),
-            19 => Ok(Self::BatchReadMemory),
-            20 => Ok(Self::BatchReadMemoryResponse),
-            21 => Ok(Self::TraversePointerChain),
-            22 => Ok(Self::TraversePointerChainResponse),
-            0xFFFF => Ok(Self::Error),
-            0xFFFE => Ok(Self::ErrorDetail),
-            _ => Err(ProtocolError::UnknownMessageType),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolError {
@@ -154,137 +102,11 @@ pub trait WireDecode<'a>: Sized {
     fn decode(message_type: MessageType, payload: &'a [u8]) -> Result<Self, ProtocolError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Frame<'a> {
-    pub message_type: MessageType,
-    pub payload: &'a [u8],
-}
-
-impl<'a> Frame<'a> {
-    pub fn parse(input: &'a [u8]) -> Result<Self, ProtocolError> {
-        if input.len() < HEADER_SIZE {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        if u32::from_le_bytes([input[0], input[1], input[2], input[3]]) != MAGIC {
-            return Err(ProtocolError::InvalidMagic);
-        }
-        let ty = MessageType::from_u16(u16::from_le_bytes([input[4], input[5]]))?;
-        let length = u32::from_le_bytes([input[6], input[7], input[8], input[9]]) as usize;
-        if length > MAX_FRAME_SIZE - HEADER_SIZE {
-            return Err(ProtocolError::TooLarge);
-        }
-        let end = HEADER_SIZE
-            .checked_add(length)
-            .ok_or(ProtocolError::InvalidLength)?;
-        if input.len() != end {
-            return Err(if input.len() < end {
-                ProtocolError::BufferTooSmall
-            } else {
-                ProtocolError::InvalidLength
-            });
-        }
-        Ok(Self {
-            message_type: ty,
-            payload: &input[HEADER_SIZE..end],
-        })
-    }
-}
-
+#[path = "frame.rs"]
+mod frame;
+pub use frame::Frame;
 #[cfg(feature = "alloc")]
-pub struct FrameDecoder {
-    buffer: Vec<u8>,
-    max_frame_size: usize,
-}
-
-#[cfg(feature = "alloc")]
-impl FrameDecoder {
-    pub fn new() -> Self {
-        Self::with_capacity(MAX_FRAME_SIZE)
-    }
-    pub fn with_capacity(max_frame_size: usize) -> Self {
-        Self {
-            buffer: Vec::new(),
-            max_frame_size: core::cmp::max(
-                HEADER_SIZE,
-                core::cmp::min(max_frame_size, MAX_FRAME_SIZE),
-            ),
-        }
-    }
-    pub fn push(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
-        if self
-            .buffer
-            .len()
-            .checked_add(bytes.len())
-            .ok_or(ProtocolError::TooLarge)?
-            > self.max_frame_size
-        {
-            return Err(ProtocolError::TooLarge);
-        }
-        self.buffer.extend_from_slice(bytes);
-        Ok(())
-    }
-    pub fn next(&mut self) -> Result<Option<Frame<'_>>, ProtocolError> {
-        if self.buffer.len() < HEADER_SIZE {
-            return Ok(None);
-        }
-        if u32::from_le_bytes([
-            self.buffer[0],
-            self.buffer[1],
-            self.buffer[2],
-            self.buffer[3],
-        ]) != MAGIC
-        {
-            self.buffer.clear();
-            return Err(ProtocolError::InvalidMagic);
-        }
-        let length = u32::from_le_bytes([
-            self.buffer[6],
-            self.buffer[7],
-            self.buffer[8],
-            self.buffer[9],
-        ]) as usize;
-        let total = HEADER_SIZE
-            .checked_add(length)
-            .ok_or(ProtocolError::InvalidLength)?;
-        if length > self.max_frame_size - HEADER_SIZE {
-            self.buffer.clear();
-            return Err(ProtocolError::TooLarge);
-        }
-        if self.buffer.len() < total {
-            return Ok(None);
-        }
-        let ty = MessageType::from_u16(u16::from_le_bytes([self.buffer[4], self.buffer[5]]))?;
-        let frame = Frame {
-            message_type: ty,
-            payload: &self.buffer[HEADER_SIZE..total],
-        };
-        // The borrowed frame is valid until the next mutation of the decoder.
-        // Copying is deliberately avoided here; callers should consume it immediately.
-        Ok(Some(frame))
-    }
-    pub fn consume(&mut self) -> Result<(), ProtocolError> {
-        if self.buffer.len() < HEADER_SIZE {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        let length = u32::from_le_bytes([
-            self.buffer[6],
-            self.buffer[7],
-            self.buffer[8],
-            self.buffer[9],
-        ]) as usize;
-        let total = HEADER_SIZE
-            .checked_add(length)
-            .ok_or(ProtocolError::InvalidLength)?;
-        if self.buffer.len() < total {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        self.buffer.drain(..total);
-        Ok(())
-    }
-    pub fn buffered_len(&self) -> usize {
-        self.buffer.len()
-    }
-}
+pub use frame::FrameDecoder;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadProcessMemory {
@@ -359,6 +181,27 @@ pub enum Request<'a> {
         base: u64,
         offsets: &'a [u8],
     },
+    LockMemory {
+        pid: u64,
+        address: u64,
+        data: &'a [u8],
+    },
+    UnlockMemory {
+        pid: u64,
+        address: u64,
+    },
+    ClearMemoryLocks {
+        pid: u64,
+    },
+    LockMemoryRva {
+        pid: u64,
+        relative_address: u64,
+        data: &'a [u8],
+    },
+    UnlockMemoryRva {
+        pid: u64,
+        relative_address: u64,
+    },
 }
 
 #[cfg(feature = "alloc")]
@@ -373,6 +216,7 @@ pub enum Response<'a> {
     ProcessBase(u64),
     BatchReadMemory(&'a [u8]),
     PointerChainResult(u64),
+    LockComplete,
 }
 
 #[cfg(feature = "alloc")]
@@ -477,6 +321,11 @@ impl<'a> WireEncode for Request<'a> {
             Self::WriteProcessMemory { .. } => MessageType::WriteProcessMemory,
             Self::BatchReadMemory { .. } => MessageType::BatchReadMemory,
             Self::TraversePointerChain { .. } => MessageType::TraversePointerChain,
+            Self::LockMemory { .. } => MessageType::LockMemory,
+            Self::UnlockMemory { .. } => MessageType::UnlockMemory,
+            Self::ClearMemoryLocks { .. } => MessageType::ClearMemoryLocks,
+            Self::LockMemoryRva { .. } => MessageType::LockMemoryRva,
+            Self::UnlockMemoryRva { .. } => MessageType::UnlockMemoryRva,
         }
     }
     fn encoded_len(&self) -> Result<usize, ProtocolError> {
@@ -518,6 +367,14 @@ impl<'a> WireEncode for Request<'a> {
                     .checked_add(offsets.len())
                     .ok_or(ProtocolError::TooLarge)?
             }
+            Self::LockMemory { data, .. } => 20usize
+                .checked_add(data.len())
+                .ok_or(ProtocolError::TooLarge)?,
+            Self::UnlockMemory { .. } | Self::ClearMemoryLocks { .. } => 16,
+            Self::LockMemoryRva { data, .. } => 20usize
+                .checked_add(data.len())
+                .ok_or(ProtocolError::TooLarge)?,
+            Self::UnlockMemoryRva { .. } => 16,
         };
         if n > MAX_FRAME_SIZE - HEADER_SIZE {
             Err(ProtocolError::TooLarge)
@@ -625,6 +482,36 @@ impl<'a> WireEncode for Request<'a> {
                 let count = (offsets.len() / 8) as u32;
                 out[26..30].copy_from_slice(&count.to_le_bytes());
                 out[30..total].copy_from_slice(offsets);
+            }
+            Self::LockMemory { pid, address, data } => {
+                out[10..18].copy_from_slice(&pid.to_le_bytes());
+                out[18..26].copy_from_slice(&address.to_le_bytes());
+                out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                out[30..total].copy_from_slice(data);
+            }
+            Self::UnlockMemory { pid, address } => {
+                out[10..18].copy_from_slice(&pid.to_le_bytes());
+                out[18..26].copy_from_slice(&address.to_le_bytes());
+            }
+            Self::ClearMemoryLocks { pid } => {
+                out[10..18].copy_from_slice(&pid.to_le_bytes());
+            }
+            Self::LockMemoryRva {
+                pid,
+                relative_address,
+                data,
+            } => {
+                out[10..18].copy_from_slice(&pid.to_le_bytes());
+                out[18..26].copy_from_slice(&relative_address.to_le_bytes());
+                out[26..30].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                out[30..total].copy_from_slice(data);
+            }
+            Self::UnlockMemoryRva {
+                pid,
+                relative_address,
+            } => {
+                out[10..18].copy_from_slice(&pid.to_le_bytes());
+                out[18..26].copy_from_slice(&relative_address.to_le_bytes());
             }
         }
         Ok(total)
@@ -746,6 +633,39 @@ impl<'a> WireDecode<'a> for Request<'a> {
                     offsets: if count > 0 { &p[20..] } else { &[] },
                 })
             }
+            MessageType::LockMemory if p.len() >= 20 => {
+                let size = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
+                if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE || p.len() != 20 + size {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(Self::LockMemory {
+                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
+                    address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+                    data: &p[20..],
+                })
+            }
+            MessageType::UnlockMemory if p.len() == 16 => Ok(Self::UnlockMemory {
+                pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
+                address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+            }),
+            MessageType::ClearMemoryLocks if p.len() == 8 => Ok(Self::ClearMemoryLocks {
+                pid: u64::from_le_bytes(p.try_into().unwrap()),
+            }),
+            MessageType::LockMemoryRva if p.len() >= 20 => {
+                let size = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
+                if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE || p.len() != 20 + size {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(Self::LockMemoryRva {
+                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
+                    relative_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+                    data: &p[20..],
+                })
+            }
+            MessageType::UnlockMemoryRva if p.len() == 16 => Ok(Self::UnlockMemoryRva {
+                pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
+                relative_address: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+            }),
             _ => Err(ProtocolError::InvalidPayload),
         }
     }
@@ -764,6 +684,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessBase(_) => MessageType::GetProcessBaseResponse,
             Self::BatchReadMemory(_) => MessageType::BatchReadMemoryResponse,
             Self::PointerChainResult(_) => MessageType::TraversePointerChainResponse,
+            Self::LockComplete => MessageType::LockMemoryResponse,
         }
     }
     fn encoded_len(&self) -> Result<usize, ProtocolError> {
@@ -777,6 +698,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessBase(_) => 8,
             Self::BatchReadMemory(v) => v.len(),
             Self::PointerChainResult(_) => 8,
+            Self::LockComplete => 0,
         };
         let total = HEADER_SIZE
             .checked_add(payload_len)
@@ -805,6 +727,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessBase(base) => out[10..18].copy_from_slice(&base.to_le_bytes()),
             Self::BatchReadMemory(v) => out[10..total].copy_from_slice(v),
             Self::PointerChainResult(addr) => out[10..18].copy_from_slice(&addr.to_le_bytes()),
+            Self::LockComplete => {}
         }
         Ok(total)
     }
@@ -833,6 +756,7 @@ impl<'a> WireDecode<'a> for Response<'a> {
             MessageType::TraversePointerChainResponse if payload.len() == 8 => Ok(
                 Self::PointerChainResult(u64::from_le_bytes(payload.try_into().unwrap())),
             ),
+            MessageType::LockMemoryResponse if payload.is_empty() => Ok(Self::LockComplete),
             _ => Err(ProtocolError::InvalidPayload),
         }
     }

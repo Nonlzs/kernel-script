@@ -23,7 +23,7 @@ end
 Notes:
 
 - `OnStart` is called once after the script is loaded.
-- `OnUpdate` is the only per-frame callback and is called once for each GUI frame.
+- `OnUpdate` is the only per-frame callback. The overlay frame rate is capped at 100 Hz.
 - UI and draw APIs are available during `OnUpdate`.
 - `OnDestroy` is called on hot-reload or GUI exit.
 - All memory API calls are synchronous and block the Lua thread for ~60-100μs.
@@ -142,6 +142,127 @@ memory.write_rva(pid, 0x1234, {
 ```
 
 RVA read/write is also limited to 4096 bytes per transfer.
+
+## Config API
+
+Scripts cannot access the filesystem. Persistent settings go through the
+`config` API, which stores typed key/value entries in `config.json` beside
+`ks-gui.exe`. The store lives in the GUI process: it survives script hot
+reload, and pending changes are written to disk within one second (also on
+`config.save()` and when the GUI exits).
+
+### config.set
+
+Stores a value under a key. Accepts `boolean`, `integer`, `number` or
+`string` (tables/functions are rejected). Returns `true` on success.
+
+```lua
+config.set("aimbot.fov", 45.0)
+config.set("aimbot.enabled", true)
+config.set("target.name", "boss")
+```
+
+### config.get
+
+Returns the stored value for a key, or `default` (nil when omitted) if the
+key does not exist.
+
+```lua
+local fov = config.get("aimbot.fov", 45.0)
+local enabled = config.get("aimbot.enabled", false)
+```
+
+### config.remove
+
+Deletes a key. Returns `true` when the key existed.
+
+```lua
+config.remove("target.name")
+```
+
+### config.save
+
+Forces an immediate write of pending changes. Returns `true` when everything
+is persisted.
+
+```lua
+config.save()
+```
+
+Constraints:
+
+- Key length: 1–128 bytes.
+- String value length: up to 4096 bytes.
+- Maximum entries: 256 (shared by all loaded scripts; prefix keys with the
+  script name to avoid collisions).
+- Writes are debounced (at most one write per second) and atomic
+  (temp file + rename); a crash never leaves a half-written file.
+
+## Memory Lock API
+
+Memory lock maintains a periodic write that continuously rewrites a byte
+pattern to a target address as fast as the driver round trip allows. Locks
+are identified by a composite key
+`(pid, absolute_address)`. Locking the same pair again updates the data
+without creating a duplicate entry.
+
+The lock table lives in `ks-service`: a dedicated rewrite thread replays
+every entry through the normal write path (`IOCTL_WRITE_MEMORY`) in a pure
+spin — back-to-back sweeps paced only by the IOCTL round trip (tens of
+thousands of writes per second, one busy core). The driver keeps no lock
+state. The table supports up to 64 entries, each 1–4096 bytes. All writes
+use the same kernel primitive as ordinary `memory.write_*` calls.
+
+### memory.lock
+
+Locks a byte pattern to an absolute address. The service rewrites `data` to
+`address` in the target process continuously (pure spin) until unlocked.
+
+```lua
+memory.lock(pid, address, {0x90, 0x90, 0x90, 0xC3})
+```
+
+### memory.unlock
+
+Removes a lock by `(pid, address)`. Does **not** restore the original value;
+it only stops subsequent periodic writes.
+
+```lua
+memory.unlock(pid, address)
+```
+
+### memory.unlock_all
+
+Removes all locks for a given PID.
+
+```lua
+memory.unlock_all(pid)
+```
+
+### memory.lock_rva
+
+Locks a byte pattern at `base + relative_address`. The service resolves the
+image base when the lock is created (same base as `get_process_base`).
+
+```lua
+memory.lock_rva(pid, 0x1234, {0x90, 0x90})
+```
+
+### memory.unlock_rva
+
+Removes a lock identified by `(pid, relative_address)`.
+
+```lua
+memory.unlock_rva(pid, 0x1234)
+```
+
+Constraints:
+
+- All lock APIs are synchronous; they only update the service lock table.
+- The periodic write runs in `ks-service`, not in the driver.
+- Data size per lock: 1–4096 bytes.
+- Maximum locks: 64 (service-wide).
+- Locks are cleared when the service stops.
 
 ## MDL Memory API
 
@@ -589,6 +710,7 @@ can comfortably fit 100+ synchronous memory reads per frame.
 - All memory API calls are synchronous and block the Lua thread for ~60-100μs.
 - Single memory read/write limit: 4096 bytes.
 - Batch read limit: 256 entries, 4096 bytes total.
+- Memory lock limit: 64 entries, 4096 bytes per entry, 10ms write interval.
 - Process list is enumerated in user mode by the service.
 - Memory read/write and RVA computation are performed by the driver.
 - Window rect enumeration runs in the GUI process (user session).

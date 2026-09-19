@@ -3,6 +3,7 @@
 pub mod dispatch;
 pub mod memory;
 mod wdm;
+mod wire;
 
 pub use ks_core::protocol;
 pub use wdm::{DRIVER_OBJECT, NTSTATUS, UNICODE_STRING};

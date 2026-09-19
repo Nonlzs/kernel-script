@@ -23,7 +23,7 @@ end
 说明：
 
 - `OnStart` 在脚本加载后调用一次。
-- `OnUpdate` 是唯一的每帧回调，每个 GUI 帧调用一次。
+- `OnUpdate` 是唯一的每帧回调。覆盖层帧率封顶 100Hz。
 - UI 和 draw API 都在 `OnUpdate` 中使用。
 - `OnDestroy` 在热重载或 GUI 退出时调用。
 - 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
@@ -140,6 +140,119 @@ memory.write_rva(pid, 0x1234, {
 ```
 
 RVA 读写同样受 4096 字节单次 driver 传输限制。
+
+## Config API（配置保存）
+
+脚本无法直接访问文件系统。持久化设置通过 `config` API 完成，条目以类型化
+键值对保存在 `ks-gui.exe` 旁的 `config.json` 中。配置存储位于 GUI 进程内：
+热重载不会丢失，挂起的更改在 1 秒内落盘（`config.save()` 与 GUI 退出时也会
+写入）。
+
+### config.set
+
+按键存储值。接受 `boolean`、`integer`、`number` 或 `string`（table/function
+会被拒绝）。成功返回 `true`。
+
+```lua
+config.set("aimbot.fov", 45.0)
+config.set("aimbot.enabled", true)
+config.set("target.name", "boss")
+```
+
+### config.get
+
+返回键对应的存储值；键不存在时返回 `default`（省略时为 nil）。
+
+```lua
+local fov = config.get("aimbot.fov", 45.0)
+local enabled = config.get("aimbot.enabled", false)
+```
+
+### config.remove
+
+删除键。键存在时返回 `true`。
+
+```lua
+config.remove("target.name")
+```
+
+### config.save
+
+强制立即写入挂起的更改。全部持久化后返回 `true`。
+
+```lua
+config.save()
+```
+
+约束：
+
+- 键长度：1–128 字节。
+- 字符串值长度：最多 4096 字节。
+- 最大条目数：256（所有已加载脚本共享；键加脚本名前缀避免冲突）。
+- 写入经过防抖（每秒最多一次）且为原子操作（临时文件 + 重命名）；崩溃
+  不会留下半写的文件。
+
+## Memory Lock API（内存锁定）
+
+Memory lock 维护一个周期性写入，以驱动往返允许的速度持续向目标地址重写指定
+字节模式。锁以 `(pid, absolute_address)` 复合键标识，对同一键重复 lock 会
+更新数据而不创建重复条目。
+
+锁表位于 `ks-service`：专用重写线程以纯自旋方式将每条锁通过普通写入路径
+（`IOCTL_WRITE_MEMORY`）连续重放——sweep 之间无间隔，仅由 IOCTL 往返耗时
+决定频率（每秒数万次，占用一个核心）。Driver 不保存任何锁状态。锁表最多
+64 条，每条 1–4096 字节。所有写入与普通 `memory.write_*` 使用完全相同的
+内核原语。
+
+### memory.lock
+
+将字节模式锁定到绝对地址。Service 以纯自旋方式持续将 `data` 写入目标进程的
+`address`，直到 unlock。
+
+```lua
+memory.lock(pid, address, {0x90, 0x90, 0x90, 0xC3})
+```
+
+### memory.unlock
+
+按 `(pid, address)` 移除锁。**不**恢复原始值，仅停止后续周期性写入。
+
+```lua
+memory.unlock(pid, address)
+```
+
+### memory.unlock_all
+
+移除指定 PID 的全部锁。
+
+```lua
+memory.unlock_all(pid)
+```
+
+### memory.lock_rva
+
+将字节模式锁定到 `base + relative_address`。Service 在创建锁时解析 image
+base（与 `get_process_base` 相同）。
+
+```lua
+memory.lock_rva(pid, 0x1234, {0x90, 0x90})
+```
+
+### memory.unlock_rva
+
+按 `(pid, relative_address)` 移除锁。
+
+```lua
+memory.unlock_rva(pid, 0x1234)
+```
+
+约束：
+
+- 所有 lock API 均为同步调用，仅更新 service 锁表。
+- 周期性写入在 `ks-service` 中执行，不在 driver 中。
+- 每条锁数据大小：1–4096 字节。
+- 最大锁数量：64 条（service 全局）。
+- Service 停止时所有锁自动清除。
 
 ## MDL Memory API
 
@@ -582,6 +695,7 @@ GUI 到 service 的 IPC 使用同步阻塞 Named Pipe 调用：
 - 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
 - 单次内存读写最多 4096 字节。
 - 批量读取限制：最多 256 个条目，总计 4096 字节。
+- 内存锁限制：64 条，每条最多 4096 字节，10ms 写入间隔。
 - 进程列表由 service 在用户态枚举。
 - 内存读写和 RVA 计算由 driver 执行。
 - 窗口枚举在 GUI 进程（用户会话）中执行。

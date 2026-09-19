@@ -229,21 +229,22 @@ pub fn batch_read_process_memory(
 /// pointer at `base + offsets[0]`, then read at `result + offsets[1]`, etc.
 ///
 /// Returns the final address, or 0 if any pointer is null or unreadable.
-pub fn traverse_pointer_chain(process_id: u64, base: u64, offsets: &[u64]) -> u64 {
+pub fn traverse_pointer_chain(
+    process_id: u64,
+    base: u64,
+    offsets: &[u64],
+) -> Result<u64, NTSTATUS> {
     if process_id == 0 || offsets.is_empty() {
-        return 0;
+        return Err(STATUS_INVALID_PARAMETER);
     }
-    let process = match lookup(process_id) {
-        Ok(p) => p,
-        Err(_) => return 0,
-    };
+    let process = lookup(process_id)?;
     let mut current = base;
     for &offset in offsets {
         if current == 0 {
-            return 0;
+            return Err(STATUS_INVALID_ADDRESS);
         }
         let Some(target) = current.checked_add(offset) else {
-            return 0;
+            return Err(STATUS_INTEGER_OVERFLOW);
         };
         let mut ptr_value: u64 = 0;
         let mut copied = 0usize;
@@ -257,9 +258,13 @@ pub fn traverse_pointer_chain(process_id: u64, base: u64, offsets: &[u64]) -> u6
             )
         };
         if !nt_success(status) || copied != 8 {
-            return 0;
+            return Err(if nt_success(status) {
+                STATUS_ACCESS_VIOLATION
+            } else {
+                status
+            });
         }
         current = ptr_value;
     }
-    current
+    Ok(current)
 }

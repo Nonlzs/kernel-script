@@ -8,8 +8,8 @@
 
 - `ks-core`: shared `no_std` protocol and ABI definitions.
 - `ks-driver`: `no_std` WDM kernel driver. It performs target-process memory reads and writes.
-- `ks-service`: SYSTEM user-mode service. It owns the TCP IPC server, driver handle, driver request dispatch, and user-mode process enumeration.
-- `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the Lua VM, synchronous Named Pipe IPC client, and draw command pipeline.
+- `ks-service`: SYSTEM user-mode service. It owns the Named Pipe IPC server, driver handle, driver request dispatch, the user-mode process enumeration, and the memory lock table with its periodic rewrite task.
+- `ks-gui`: user-mode egui/eframe OpenGL GUI and Lua runtime. It owns the Lua VM, synchronous Named Pipe IPC client, draw command pipeline, and the Lua config store (`config.json`, module `ks-gui/src/config_store.rs`).
 - `ks-launcher`: elevated egui GUI with ordered `Start Driver`, `Start Service`, and `Start GUI` actions.
 
 `ks-launcher` uses `sc.exe` to start the driver and service, then launches the
@@ -21,7 +21,7 @@ The intended data flow is:
 ```text
 Lua (synchronous call)
     -> ks-gui blocking Named Pipe IPC
-    -> ks-service Tokio TCP server
+    -> ks-service Tokio Named Pipe server
     -> driver worker / DeviceIoControl
     -> ks-driver
 ```
@@ -38,9 +38,15 @@ Process enumeration and process-name-to-PID lookup are service responsibilities.
 - Use explicit little-endian wire encoding. Do not expose Rust struct layout on the TCP protocol.
 - Validate lengths, counts, addresses, PIDs, and frame sizes at every trust boundary.
 - Use `windows-sys` with narrow feature lists when possible.
+- Use `zerocopy` only for validated fixed-layout driver-local ABI views. Keep
+  `ks-core` dependency-free and keep TCP/Named Pipe payloads explicitly
+  little-endian and length-checked.
 - Do not reintroduce removed synchronous Lua APIs. GUI Lua IPC APIs must remain synchronous.
 - Do not call blocking network operations, `block_on`, or synchronous driver operations from the GUI render thread.
 - Lua VM objects must only be accessed by the GUI Lua thread. Never send `Lua`, `Thread`, `Function`, or registry keys to worker threads.
+- Lua scripts have no filesystem access. All persistent script state goes
+  through the `config` API (`ks-gui/src/config_store.rs`): typed scalar
+  entries only, bounded sizes, debounced atomic writes to `config.json`.
 - Background workers may send only task IDs and owned plain data back to the GUI thread.
 
 ## GUI and Lua Lifecycle
@@ -79,6 +85,15 @@ memory.write_mdl_rva(pid, relative_address, data)
 memory.batch_read(pid, size, addresses)
 memory.batch_offset(sizes)
 memory.traverse_pointer_chain(pid, base, offsets)
+memory.lock(pid, address, data)
+memory.unlock(pid, address)
+memory.unlock_all(pid)
+memory.lock_rva(pid, relative_address, data)
+memory.unlock_rva(pid, relative_address)
+config.set(key, value)
+config.get(key, default)
+config.remove(key)
+config.save()
 ```
 
 Typical usage:
@@ -150,6 +165,13 @@ The secure device wrapper uses `WdmlibIoCreateDeviceSecure` and links the WDK
 `wdmsec` and `BufferOverflowK` libraries. Keep this dependency in the WDK-only
 driver build path.
 
+Memory locks live entirely in `ks-service` (`driver_comm.rs`): a dedicated
+OS thread (`lock_rewrite_loop`, spawned by `run_lock_worker`) sweeps every
+entry through the normal `IOCTL_WRITE_MEMORY` path in a pure spin
+(`LOCK_REWRITE_INTERVAL = ZERO`; each IOCTL round trip paces the loop, one
+busy core). The driver keeps no lock state and exposes no lock IOCTLs. Lock
+limits (64 entries, max 4096 bytes each) are enforced in the service.
+
 Inspect the native driver image with platform linker tools before loading it.
 Driver signing and VM deployment are environment-specific and are outside the
 workspace source tree.
@@ -180,6 +202,13 @@ Before considering a change complete:
   `dumpbin /imports` contains no `ntdll.dll` before deploying, and route
   kernel calls through `seh_shim.c` `ks_*` wrappers. All alloc wire
   protocol, service, GUI, and Lua API code has been removed.
+- A kernel-side lock worker (system thread + kernel lock table +
+  `IOCTL_LOCK_MEMORY*`) was also removed after repeated bugchecks in the
+  field. A system thread performing periodic writes through
+  `MmCopyVirtualMemory` bugchecked on real game targets even though the
+  identical `IOCTL_WRITE_MEMORY` path from the service process was stable.
+  Locks must stay service-side (`run_lock_worker` in `driver_comm.rs`);
+  do not reintroduce kernel background writers.
 - The driver exposes normal memory I/O (`IOCTL_READ_MEMORY`/`IOCTL_WRITE_MEMORY`
   and their RVA variants) alongside separate MDL-remap I/O
   (`IOCTL_READ_MEMORY_MDL`/`IOCTL_WRITE_MEMORY_MDL` and their RVA variants).

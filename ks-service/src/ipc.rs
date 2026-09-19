@@ -345,6 +345,40 @@ fn dispatch_sync(
                 offsets: parsed,
             }
         }
+        Request::LockMemory { pid, address, data } => {
+            if pid == 0 || address == 0 || data.is_empty() || data.len() > MAX_DRIVER_TRANSFER_SIZE
+            {
+                return encode_response(Response::Error(6));
+            }
+            OwnedRequest::LockMemory {
+                pid,
+                address,
+                data: data.to_vec(),
+            }
+        }
+        Request::UnlockMemory { pid, address } => OwnedRequest::UnlockMemory { pid, address },
+        Request::ClearMemoryLocks { pid } => OwnedRequest::ClearMemoryLocks { pid },
+        Request::LockMemoryRva {
+            pid,
+            relative_address,
+            data,
+        } => {
+            if pid == 0 || data.is_empty() || data.len() > MAX_DRIVER_TRANSFER_SIZE {
+                return encode_response(Response::Error(6));
+            }
+            OwnedRequest::LockMemoryRva {
+                pid,
+                relative_address,
+                data: data.to_vec(),
+            }
+        }
+        Request::UnlockMemoryRva {
+            pid,
+            relative_address,
+        } => OwnedRequest::UnlockMemoryRva {
+            pid,
+            relative_address,
+        },
     };
 
     match request {
@@ -474,6 +508,39 @@ fn dispatch_sync(
                 }
             }
         }
+        OwnedRequest::LockMemory { pid, address, data } => {
+            match driver_comm::lock_memory(handle, pid, address, &data) {
+                Ok(()) => encode_response(Response::LockComplete),
+                Err(error) => encode_error_detail(&error),
+            }
+        }
+        OwnedRequest::UnlockMemory { pid, address } => {
+            match driver_comm::unlock_memory(handle, pid, address) {
+                Ok(()) => encode_response(Response::LockComplete),
+                Err(error) => encode_error_detail(&error),
+            }
+        }
+        OwnedRequest::ClearMemoryLocks { pid } => {
+            match driver_comm::clear_memory_locks(handle, pid) {
+                Ok(()) => encode_response(Response::LockComplete),
+                Err(error) => encode_error_detail(&error),
+            }
+        }
+        OwnedRequest::LockMemoryRva {
+            pid,
+            relative_address,
+            data,
+        } => match driver_comm::lock_memory_rva(handle, pid, relative_address, &data) {
+            Ok(()) => encode_response(Response::LockComplete),
+            Err(error) => encode_error_detail(&error),
+        },
+        OwnedRequest::UnlockMemoryRva {
+            pid,
+            relative_address,
+        } => match driver_comm::unlock_memory_rva(handle, pid, relative_address) {
+            Ok(()) => encode_response(Response::LockComplete),
+            Err(error) => encode_error_detail(&error),
+        },
     }
 }
 
@@ -546,6 +613,27 @@ enum OwnedRequest {
         pid: u64,
         base: u64,
         offsets: Vec<u64>,
+    },
+    LockMemory {
+        pid: u64,
+        address: u64,
+        data: Vec<u8>,
+    },
+    UnlockMemory {
+        pid: u64,
+        address: u64,
+    },
+    ClearMemoryLocks {
+        pid: u64,
+    },
+    LockMemoryRva {
+        pid: u64,
+        relative_address: u64,
+        data: Vec<u8>,
+    },
+    UnlockMemoryRva {
+        pid: u64,
+        relative_address: u64,
     },
 }
 

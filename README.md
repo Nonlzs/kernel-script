@@ -70,7 +70,7 @@ kernel-script/
 │   └── src/
 │       ├── app.rs               # overlay application and frame rendering
 │       ├── lua_runtime.rs       # Lua VM lifecycle and API registration
-│       ├── lua_runtime/         # execution and runtime types
+│       ├── lua_runtime/         # engine API, execution, and runtime types
 │       ├── overlay.rs            # generic draw-command painter bridge
 │       ├── sync_ipc.rs          # synchronous Named Pipe client
 │       └── window_util.rs       # target-window geometry lookup
@@ -91,8 +91,11 @@ function OnDestroy() end
 ```
 
 - `OnStart` runs once after loading.
-- `OnUpdate` is the only per-frame callback. It runs once per GUI frame and performs calculations, optional
-  synchronous memory operations, UI calls, and drawing in one Lua invocation.
+- `OnUpdate` is the only per-frame callback. The whole overlay (rendering plus
+  OnUpdate) is capped at 100 Hz; a slow callback simply lowers the frame rate.
+  It performs calculations, optional synchronous memory operations, UI calls,
+  and drawing in one Lua invocation. Budgets are advisory warnings, never
+  errors.
 - The callback runs on the GUI Lua thread; long synchronous IPC still delays the
   next frame, so scripts should keep work bounded.
 - `OnDestroy` runs during hot reload and shutdown.
@@ -146,6 +149,10 @@ Run the GUI from an interactive desktop session because GLFW/OpenGL requires a
 window station. Lua scripts are loaded from the `scripts` directory beside the
 GUI executable. Files whose stem begins with `_` are kept available for manual
 testing but are not loaded by default.
+
+Press `Insert` at any time to show or hide the egui script windows. The
+`draw.*` overlay layer and all script calculations keep running while the UI
+is hidden.
 
 The launcher provides three ordered actions: `Start Driver`, `Start Service`,
 and `Start GUI`. Later actions remain disabled until earlier actions are

@@ -3,6 +3,7 @@ mod ipc;
 mod process;
 
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -111,10 +112,15 @@ async fn run_runtime_async(stop_rx: broadcast::Receiver<()>) {
             return;
         }
     };
+    let lock_worker = tokio::spawn(driver_comm::run_lock_worker(
+        Arc::clone(&handle),
+        stop_rx.resubscribe(),
+    ));
     let ipc = tokio::spawn(ipc::start_server(handle, stop_rx));
     if let Err(error) = ipc.await {
         tracing::error!(%error, "IPC server task failed");
     }
+    let _ = lock_worker.await;
     comm.disconnect();
 }
 

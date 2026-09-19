@@ -2,13 +2,28 @@ use core::{mem, ptr};
 
 use crate::memory;
 use crate::wdm::*;
-use ks_core::protocol::{
+use crate::wire::{
     MemoryReadRequest, MemoryRvaReadRequest, MemoryRvaWriteRequest, MemoryWriteRequest,
-    ProcessBaseRequest, IOCTL_BATCH_READ_MEMORY, IOCTL_TRAVERSE_POINTER_CHAIN, MAX_BATCH_ENTRIES,
+    ProcessBaseRequest,
+};
+use ks_core::protocol::{
+    IOCTL_BATCH_READ_MEMORY, IOCTL_TRAVERSE_POINTER_CHAIN, MAX_BATCH_ENTRIES,
     MAX_DRIVER_TRANSFER_SIZE,
 };
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
-const READ_RESPONSE_SIZE: usize = 4 + 1 + 3 + MAX_DRIVER_TRANSFER_SIZE + 4;
+use ks_core::protocol::READ_RESPONSE_SIZE;
+
+unsafe fn request_from_system<'a, T>(
+    system: *const u8,
+    input_length: u32,
+) -> Result<&'a T, NTSTATUS>
+where
+    T: FromBytes + Immutable + KnownLayout,
+{
+    let bytes = core::slice::from_raw_parts(system, input_length as usize);
+    T::ref_from_bytes(bytes).map_err(|_| STATUS_BUFFER_TOO_SMALL)
+}
 
 const DEVICE_NAME: &[u16] = &[
     b'\\' as u16,
@@ -127,6 +142,9 @@ unsafe extern "system" fn dispatch_unsupported(
     _device: *const DEVICE_OBJECT,
     irp: *mut IRP,
 ) -> NTSTATUS {
+    if irp.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
     unsafe { complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0) }
 }
 
@@ -134,6 +152,9 @@ unsafe extern "system" fn dispatch_create_close(
     _device: *const DEVICE_OBJECT,
     irp: *mut IRP,
 ) -> NTSTATUS {
+    if irp.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
     let status = unsafe { ks_authorize_device_request(irp) };
     unsafe { complete(irp, status, 0) }
 }
@@ -167,7 +188,11 @@ unsafe extern "system" fn dispatch_device_control(
                 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let request = &*(system as *const MemoryReadRequest);
+                    let request =
+                        match request_from_system::<MemoryReadRequest>(system, input_length) {
+                            Ok(request) => request,
+                            Err(status) => return complete(irp, status, 0),
+                        };
                     if request.process_id == 0
                         || request.address == 0
                         || request.size == 0
@@ -190,7 +215,11 @@ unsafe extern "system" fn dispatch_device_control(
                 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let request = &*(system as *const MemoryReadRequest);
+                    let request =
+                        match request_from_system::<MemoryReadRequest>(system, input_length) {
+                            Ok(request) => request,
+                            Err(status) => return complete(irp, status, 0),
+                        };
                     if request.process_id == 0
                         || request.address == 0
                         || request.size == 0
@@ -213,7 +242,11 @@ unsafe extern "system" fn dispatch_device_control(
                 if input_length < mem::size_of::<MemoryWriteRequest>() as u32 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let request = &*(system as *const MemoryWriteRequest);
+                    let request =
+                        match request_from_system::<MemoryWriteRequest>(system, input_length) {
+                            Ok(request) => request,
+                            Err(status) => return complete(irp, status, 0),
+                        };
                     if request.process_id == 0
                         || request.address == 0
                         || request.size == 0
@@ -237,7 +270,11 @@ unsafe extern "system" fn dispatch_device_control(
                 if input_length < mem::size_of::<MemoryWriteRequest>() as u32 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let request = &*(system as *const MemoryWriteRequest);
+                    let request =
+                        match request_from_system::<MemoryWriteRequest>(system, input_length) {
+                            Ok(request) => request,
+                            Err(status) => return complete(irp, status, 0),
+                        };
                     if request.process_id == 0
                         || request.address == 0
                         || request.size == 0
@@ -270,7 +307,11 @@ unsafe extern "system" fn dispatch_device_control(
                 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let request = &*(system as *const MemoryRvaReadRequest);
+                    let request =
+                        match request_from_system::<MemoryRvaReadRequest>(system, input_length) {
+                            Ok(request) => request,
+                            Err(status) => return complete(irp, status, 0),
+                        };
                     if request.process_id == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
@@ -292,7 +333,11 @@ unsafe extern "system" fn dispatch_device_control(
                 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let request = &*(system as *const MemoryRvaReadRequest);
+                    let request =
+                        match request_from_system::<MemoryRvaReadRequest>(system, input_length) {
+                            Ok(request) => request,
+                            Err(status) => return complete(irp, status, 0),
+                        };
                     if request.process_id == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
@@ -314,7 +359,11 @@ unsafe extern "system" fn dispatch_device_control(
                 if input_length < mem::size_of::<MemoryRvaWriteRequest>() as u32 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let request = &*(system as *const MemoryRvaWriteRequest);
+                    let request =
+                        match request_from_system::<MemoryRvaWriteRequest>(system, input_length) {
+                            Ok(request) => request,
+                            Err(status) => return complete(irp, status, 0),
+                        };
                     if request.process_id == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
@@ -331,7 +380,11 @@ unsafe extern "system" fn dispatch_device_control(
                 if input_length < mem::size_of::<MemoryRvaWriteRequest>() as u32 {
                     (STATUS_BUFFER_TOO_SMALL, 0)
                 } else {
-                    let request = &*(system as *const MemoryRvaWriteRequest);
+                    let request =
+                        match request_from_system::<MemoryRvaWriteRequest>(system, input_length) {
+                            Ok(request) => request,
+                            Err(status) => return complete(irp, status, 0),
+                        };
                     if request.process_id == 0
                         || request.size == 0
                         || request.size > MAX_DRIVER_TRANSFER_SIZE as u64
@@ -351,16 +404,21 @@ unsafe extern "system" fn dispatch_device_control(
                     let pid = ptr::read_unaligned(system as *const u64);
                     let size = ptr::read_unaligned(system.add(8) as *const u32);
                     let count = ptr::read_unaligned(system.add(12) as *const u32) as usize;
+                    let input_size = count.checked_mul(8).and_then(|value| value.checked_add(16));
+                    let output_size = (size as usize).checked_mul(count);
                     if pid == 0
                         || count == 0
                         || count > MAX_BATCH_ENTRIES
                         || size == 0
                         || size > MAX_DRIVER_TRANSFER_SIZE as u32
-                        || input_length < (16 + count * 8) as u32
-                        || output_length < (count * size as usize) as u32
+                        || input_size.is_none()
+                        || output_size.is_none()
+                        || input_size.is_some_and(|value| input_length < value as u32)
+                        || output_size.is_some_and(|value| (output_length as usize) < value)
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
+                        let output_size = output_size.unwrap();
                         let mut entries = [(0u64, 0u32); MAX_BATCH_ENTRIES];
                         for i in 0..count {
                             let base = 16 + i * 8;
@@ -370,7 +428,7 @@ unsafe extern "system" fn dispatch_device_control(
                         match memory::batch_read_process_memory(
                             pid,
                             &entries[..count],
-                            core::slice::from_raw_parts_mut(system, output_length as usize),
+                            core::slice::from_raw_parts_mut(system, output_size),
                         ) {
                             Ok(bytes_written) => (STATUS_SUCCESS, bytes_written),
                             Err(status) => (status, 0),
@@ -389,11 +447,13 @@ unsafe extern "system" fn dispatch_device_control(
                     } else {
                         0
                     };
+                    let input_size = count.checked_mul(8).and_then(|value| value.checked_add(20));
                     if pid == 0
                         || base == 0
                         || count == 0
                         || count > 32
-                        || input_length < (20 + count * 8) as u32
+                        || input_size.is_none()
+                        || input_size.is_some_and(|value| input_length < value as u32)
                     {
                         (STATUS_INVALID_PARAMETER, 0)
                     } else {
@@ -401,9 +461,13 @@ unsafe extern "system" fn dispatch_device_control(
                         for i in 0..count {
                             offsets[i] = ptr::read_unaligned(system.add(20 + i * 8) as *const u64);
                         }
-                        let result = memory::traverse_pointer_chain(pid, base, &offsets[..count]);
-                        ptr::write_unaligned(system as *mut u64, result);
-                        (STATUS_SUCCESS, 8)
+                        match memory::traverse_pointer_chain(pid, base, &offsets[..count]) {
+                            Ok(result) => {
+                                ptr::write_unaligned(system as *mut u64, result);
+                                (STATUS_SUCCESS, 8)
+                            }
+                            Err(status) => (status, 0),
+                        }
                     }
                 }
             }
@@ -479,7 +543,13 @@ unsafe fn process_base_ioctl(system: *mut u8) -> (NTSTATUS, usize) {
     let Some(get_base) = resolve_process_base_routine() else {
         return (STATUS_INVALID_DEVICE_REQUEST, 0);
     };
-    let request = &*(system as *const ProcessBaseRequest);
+    let request = match request_from_system::<ProcessBaseRequest>(
+        system,
+        mem::size_of::<ProcessBaseRequest>() as u32,
+    ) {
+        Ok(request) => request,
+        Err(status) => return (status, 0),
+    };
     if request.process_id == 0 {
         return (STATUS_INVALID_PARAMETER, 0);
     }

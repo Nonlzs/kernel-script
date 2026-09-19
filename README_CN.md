@@ -71,7 +71,9 @@ function OnDestroy() end
 ```
 
 - `OnStart` 在加载后执行一次。
-- `OnUpdate` 是唯一的每帧回调，每个 GUI 帧调用一次，在一次调用中完成计算、同步内存操作、UI 和绘制。
+- `OnUpdate` 是唯一的每帧回调。整个覆盖层（渲染 + OnUpdate）帧率封顶 100Hz；
+  回调变慢只会降低帧率。它在一次调用中完成计算、同步内存操作、UI 和绘制。
+  预算超时仅记录告警，不会报错。
 - 回调运行在 GUI Lua 线程；较长的同步 IPC 仍会延迟下一帧，因此脚本应限制单次工作量。
 - `OnDestroy` 在热重载和退出时执行。
 
@@ -123,6 +125,9 @@ ks-service.exe --console
 GUI 必须从交互式桌面运行，因为 GLFW/OpenGL 需要窗口站。Lua 脚本从 GUI
 可执行文件旁的 `scripts` 目录加载。文件名 stem 以下划线开头的脚本保留用于
 手动测试，但默认不会加载。
+
+随时按 `Insert` 可以显示或隐藏 egui 脚本窗口。UI 隐藏期间 `draw.*` 覆盖层
+和所有脚本计算仍然正常运行。
 
 launcher 只提供三个顺序操作：`Start Driver`、`Start Service`、`Start GUI`。
 前一项未运行时，后一项不可点击；运行中的项目显示红色 `Stop ...` 按钮。

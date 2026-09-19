@@ -6,7 +6,7 @@
  * Rust ABI frame. Compile this file with the same WDK toolchain as the
  * driver and link it into the final .sys image.
  */
-#include <ntddk.h>
+#include <ntifs.h>
 
 static const GUID KS_DEVICE_CLASS_GUID = {
     0x7d7f1e42, 0x3c5f, 0x4c3d,

@@ -70,7 +70,7 @@ impl FromLua for Address {
         match value {
             Value::Integer(value) if value > 0 => Ok(Self(value as u64)),
             Value::Integer(_) => Err(mlua::Error::runtime("address must not be negative")),
-            Value::String(value) => super::parse_address(value.to_str()?.as_ref()),
+            Value::String(value) => super::engine_api::parse_address(value.to_str()?.as_ref()),
             value => Err(mlua::Error::runtime(format!(
                 "address must be a positive integer or string, got {}",
                 value.type_name()

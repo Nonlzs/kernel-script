@@ -1,9 +1,11 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use ks_core::protocol::{
     MemoryReadRequest, MemoryWriteRequest, IOCTL_BATCH_READ_MEMORY, IOCTL_PING, IOCTL_READ_MEMORY,
     IOCTL_TRAVERSE_POINTER_CHAIN, IOCTL_WRITE_MEMORY, MAX_BATCH_ENTRIES, MAX_DRIVER_TRANSFER_SIZE,
+    MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE,
 };
 
 const DRIVER_PATH: &str = "\\\\.\\KernelScriptProfiler";
@@ -590,4 +592,149 @@ pub fn traverse_pointer_chain(
         return Err(DriverError::ResponseParseFailed);
     }
     Ok(result_ptr)
+}
+
+/// Service-side memory lock table.
+///
+/// A lock periodically rewrites a byte pattern to a target-process address.
+/// The rewriter task replays every entry through the proven
+/// `IOCTL_WRITE_MEMORY` path every 10ms; the kernel driver keeps no lock
+/// state and performs no background writes, so the memory-access context is
+/// identical to ordinary script writes.
+#[derive(Clone)]
+struct LockEntry {
+    pid: u64,
+    address: u64,
+    data: Vec<u8>,
+}
+
+static LOCKS: OnceLock<Mutex<Vec<LockEntry>>> = OnceLock::new();
+
+fn lock_table() -> &'static Mutex<Vec<LockEntry>> {
+    LOCKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn lock_insert(pid: u64, address: u64, data: &[u8]) -> Result<(), DriverError> {
+    if pid == 0 || address == 0 || data.is_empty() || data.len() > MAX_MEMORY_LOCK_SIZE {
+        return Err(DriverError::ResponseParseFailed);
+    }
+    let mut table = lock_table().lock().expect("lock table poisoned");
+    if let Some(entry) = table
+        .iter_mut()
+        .find(|entry| entry.pid == pid && entry.address == address)
+    {
+        entry.data = data.to_vec();
+    } else {
+        if table.len() >= MAX_MEMORY_LOCKS {
+            tracing::warn!(pid, "memory lock table full");
+            return Err(DriverError::ResponseParseFailed);
+        }
+        table.push(LockEntry {
+            pid,
+            address,
+            data: data.to_vec(),
+        });
+    }
+    Ok(())
+}
+
+fn lock_remove(pid: u64, address: u64) {
+    lock_table()
+        .lock()
+        .expect("lock table poisoned")
+        .retain(|entry| !(entry.pid == pid && entry.address == address));
+}
+
+fn lock_clear(pid: u64) {
+    lock_table()
+        .lock()
+        .expect("lock table poisoned")
+        .retain(|entry| entry.pid != pid);
+}
+
+fn lock_snapshot() -> Vec<LockEntry> {
+    lock_table().lock().expect("lock table poisoned").clone()
+}
+
+/// Pause between rewrite sweeps. ZERO means pure spin: sweeps run back to
+/// back at full speed (each `IOCTL_WRITE_MEMORY` round trip paces the loop),
+/// which maximizes rewrite frequency at the cost of one busy core.
+const LOCK_REWRITE_INTERVAL: Duration = Duration::ZERO;
+
+/// Rewrites every active lock entry through the normal driver write path in
+/// a tight dedicated loop (~1000 sweeps/s). Runs on its own OS thread so the
+/// sweep cost is a single core and no Tokio task dispatch is paid per tick.
+/// Exits when the service shuts down. Write failures are ignored: a vanished
+/// process or freed page simply skips the entry.
+pub async fn run_lock_worker(
+    handle: Arc<DriverHandle>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("ks-lock-rewriter".to_owned())
+        .spawn(move || lock_rewrite_loop(Arc::clone(&handle), thread_stop))
+        .expect("failed to spawn lock rewriter thread");
+    let _ = shutdown.recv().await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let _ = thread.join();
+}
+
+fn lock_rewrite_loop(handle: Arc<DriverHandle>, stop: Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    while !stop.load(Ordering::Acquire) {
+        for entry in &lock_snapshot() {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            let _ = write_memory(&handle, entry.pid, entry.address, &entry.data);
+        }
+        std::thread::sleep(LOCK_REWRITE_INTERVAL);
+    }
+}
+
+pub fn lock_memory(
+    _handle: &DriverHandle,
+    pid: u64,
+    address: u64,
+    data: &[u8],
+) -> Result<(), DriverError> {
+    lock_insert(pid, address, data)
+}
+
+pub fn lock_memory_rva(
+    handle: &DriverHandle,
+    pid: u64,
+    relative_address: u64,
+    data: &[u8],
+) -> Result<(), DriverError> {
+    let base = get_process_base(handle, pid)?;
+    let Some(address) = base.checked_add(relative_address) else {
+        return Err(DriverError::ResponseParseFailed);
+    };
+    lock_insert(pid, address, data)
+}
+
+pub fn unlock_memory(_handle: &DriverHandle, pid: u64, address: u64) -> Result<(), DriverError> {
+    lock_remove(pid, address);
+    Ok(())
+}
+
+pub fn unlock_memory_rva(
+    handle: &DriverHandle,
+    pid: u64,
+    relative_address: u64,
+) -> Result<(), DriverError> {
+    let base = get_process_base(handle, pid)?;
+    let Some(address) = base.checked_add(relative_address) else {
+        return Err(DriverError::ResponseParseFailed);
+    };
+    lock_remove(pid, address);
+    Ok(())
+}
+
+pub fn clear_memory_locks(_handle: &DriverHandle, pid: u64) -> Result<(), DriverError> {
+    lock_clear(pid);
+    Ok(())
 }
