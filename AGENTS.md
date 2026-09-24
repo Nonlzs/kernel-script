@@ -16,6 +16,18 @@
 GUI. It performs no file installation or copying; all errors and command output
 are written to its log file.
 
+Clicking a Start button renames that component's file (`ks-driver.sys`,
+`ks-service.exe`, or `ks-gui.exe`) to a fresh random name before the service
+registration or process spawn references it, and every service creation
+registers a fresh random SCM name (passed to `ks-service` through
+`--service-name` in binPath, because the windows-service dispatcher requires
+the registered name). Once a component stops, its file is renamed back to
+the canonical name (retried once per second until it succeeds; the driver
+image can stay locked for a short moment after the service reports
+STOPPED). All names
+live in `ks-launcher.state` next to the launcher so stop/cleanup works
+across restarts; do not delete that file while components are running.
+
 The intended data flow is:
 
 ```text
@@ -84,12 +96,16 @@ memory.read_mdl_rva(pid, relative_address, size)
 memory.write_mdl_rva(pid, relative_address, data)
 memory.batch_read(pid, size, addresses)
 memory.batch_offset(sizes)
+memory.batch_write(pid, writes)
 memory.traverse_pointer_chain(pid, base, offsets)
 memory.lock(pid, address, data)
 memory.unlock(pid, address)
 memory.unlock_all(pid)
 memory.lock_rva(pid, relative_address, data)
 memory.unlock_rva(pid, relative_address)
+keyboard.is_key_down(key)
+keyboard.is_key_up(key)
+keyboard.is_key_press(key)
 config.set(key, value)
 config.get(key, default)
 config.remove(key)
@@ -166,12 +182,26 @@ The secure device wrapper uses `WdmlibIoCreateDeviceSecure` and links the WDK
 driver build path.
 
 Memory locks live entirely in `ks-service` (`driver_comm.rs`): a dedicated
-OS thread (`lock_rewrite_loop`, spawned by `run_lock_worker`) sweeps every
-entry through the normal `IOCTL_WRITE_MEMORY` path in a pure spin
-(`LOCK_REWRITE_INTERVAL = ZERO`; each IOCTL round trip paces the loop, one
-busy core). The driver keeps no lock state and exposes no lock IOCTLs. Lock
-limits (64 entries, max 4096 bytes each) are enforced in the service.
-
+OS thread (`lock_rewrite_loop`, spawned by `run_lock_worker`) applies every
+entry with a single `IOCTL_WRITE_MEMORY_BATCH` per sweep in a continuous
+spin, with no inter-sweep sleep; it also runs at `THREAD_PRIORITY_BELOW_NORMAL`
+so the spinning thread can never starve the game or the service. Do not
+replace the batching with per-lock IOCTLs and do not use `yield_now`
+instead of pure spinning: full-speed sweeps with the batch write keep the
+per-lock rate at the IOCTL round-trip bound, and both per-sweep sleeps and
+yields were observed to either cap the rate or add cache-polluting context
+switches. The batch write (`IOCTL_WRITE_MEMORY_BATCH`, 0x0022_203C) carries up to
+`MAX_BATCH_WRITE_ENTRIES` (64) entries of
+`u64 pid, u64 address, u32 size, u32 pad, data` in one kernel transition
+and returns one NTSTATUS per entry; per-entry write failures are ignored by
+the sweep. Performance notes: the rewriter caches the encoded batch request
+keyed on a lock-table version counter (`LOCKS_VERSION`, bumped on every
+mutation), so sweeps between mutations submit the cached buffer with no
+table clone, no re-encode, and no table lock; the driver resolves each
+distinct PID once per batch (`memory::batch_write_process_memory`) instead
+of running `PsLookupProcessByProcessId` per entry. The driver keeps
+no lock state and exposes no lock IOCTLs. Lock limits (64 entries, max 4096
+bytes each) are enforced in the service.
 Inspect the native driver image with platform linker tools before loading it.
 Driver signing and VM deployment are environment-specific and are outside the
 workspace source tree.

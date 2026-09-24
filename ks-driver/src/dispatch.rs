@@ -1,14 +1,14 @@
 use core::{mem, ptr};
 
-use crate::memory;
+use crate::memory::{self, BatchWriteEntry};
 use crate::wdm::*;
 use crate::wire::{
     MemoryReadRequest, MemoryRvaReadRequest, MemoryRvaWriteRequest, MemoryWriteRequest,
     ProcessBaseRequest,
 };
 use ks_core::protocol::{
-    IOCTL_BATCH_READ_MEMORY, IOCTL_TRAVERSE_POINTER_CHAIN, MAX_BATCH_ENTRIES,
-    MAX_DRIVER_TRANSFER_SIZE,
+    IOCTL_BATCH_READ_MEMORY, IOCTL_TRAVERSE_POINTER_CHAIN, IOCTL_WRITE_MEMORY_BATCH,
+    MAX_BATCH_ENTRIES, MAX_BATCH_WRITE_ENTRIES, MAX_DRIVER_TRANSFER_SIZE,
 };
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 
@@ -468,6 +468,79 @@ unsafe extern "system" fn dispatch_device_control(
                             }
                             Err(status) => (status, 0),
                         }
+                    }
+                }
+            }
+            IOCTL_WRITE_MEMORY_BATCH => {
+                if input_length < 8 || output_length < 4 {
+                    (STATUS_BUFFER_TOO_SMALL, 0)
+                } else {
+                    let count = ptr::read_unaligned(system as *const u32) as usize;
+                    if count == 0
+                        || count > MAX_BATCH_WRITE_ENTRIES
+                        || output_length < (4 + count * 4) as u32
+                    {
+                        (STATUS_INVALID_PARAMETER, 0)
+                    } else {
+                        // Per-entry results are written back through the
+                        // METHOD_BUFFERED system buffer, which the I/O
+                        // manager copies to the caller on completion. Every
+                        // slot starts INVALID: entries that fail parsing or
+                        // that the write pass never reaches report why.
+                        let statuses = system as *mut NTSTATUS;
+                        ptr::write_unaligned(statuses, count as i32);
+                        for index in 0..count {
+                            ptr::write_unaligned(statuses.add(1 + index), STATUS_INVALID_PARAMETER);
+                        }
+                        // Parse pass: validate every boundary up front so
+                        // the write pass can run from a prepared array.
+                        let mut entries = [BatchWriteEntry {
+                            process_id: 0,
+                            address: 0,
+                            data: ptr::null(),
+                            len: 0,
+                        }; MAX_BATCH_WRITE_ENTRIES];
+                        let mut parsed = 0usize;
+                        let mut offset = 8usize;
+                        let input_end = input_length as usize;
+                        for slot in entries.iter_mut().take(count) {
+                            let Some(header) = offset.checked_add(24) else {
+                                break;
+                            };
+                            if header > input_end {
+                                break;
+                            }
+                            let process_id = ptr::read_unaligned(system.add(offset) as *const u64);
+                            let address = ptr::read_unaligned(system.add(offset + 8) as *const u64);
+                            let size =
+                                ptr::read_unaligned(system.add(offset + 16) as *const u32) as usize;
+                            offset = header;
+                            let Some(end) = offset.checked_add(size) else {
+                                break;
+                            };
+                            if end > input_end
+                                || process_id == 0
+                                || address == 0
+                                || size == 0
+                                || size > MAX_DRIVER_TRANSFER_SIZE
+                            {
+                                break;
+                            }
+                            *slot = BatchWriteEntry {
+                                process_id,
+                                address,
+                                data: system.add(offset),
+                                len: size,
+                            };
+                            offset = end;
+                            parsed += 1;
+                        }
+                        // Write pass: one process lookup per distinct PID.
+                        let out = core::slice::from_raw_parts_mut(statuses.add(1), parsed);
+                        // Safety: entry data pointers point into the system
+                        // buffer, which stays valid for this call.
+                        memory::batch_write_process_memory(&entries[..parsed], out);
+                        (STATUS_SUCCESS, (4 + count * 4) as usize)
                     }
                 }
             }

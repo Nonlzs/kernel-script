@@ -1,11 +1,11 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use ks_core::protocol::{
     MemoryReadRequest, MemoryWriteRequest, IOCTL_BATCH_READ_MEMORY, IOCTL_PING, IOCTL_READ_MEMORY,
-    IOCTL_TRAVERSE_POINTER_CHAIN, IOCTL_WRITE_MEMORY, MAX_BATCH_ENTRIES, MAX_DRIVER_TRANSFER_SIZE,
-    MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE,
+    IOCTL_TRAVERSE_POINTER_CHAIN, IOCTL_WRITE_MEMORY, IOCTL_WRITE_MEMORY_BATCH, MAX_BATCH_ENTRIES,
+    MAX_BATCH_WRITE_ENTRIES, MAX_DRIVER_TRANSFER_SIZE, MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE,
 };
 
 const DRIVER_PATH: &str = "\\\\.\\KernelScriptProfiler";
@@ -596,11 +596,10 @@ pub fn traverse_pointer_chain(
 
 /// Service-side memory lock table.
 ///
-/// A lock periodically rewrites a byte pattern to a target-process address.
-/// The rewriter task replays every entry through the proven
-/// `IOCTL_WRITE_MEMORY` path every 10ms; the kernel driver keeps no lock
-/// state and performs no background writes, so the memory-access context is
-/// identical to ordinary script writes.
+/// A lock continuously rewrites a byte pattern to a target-process address.
+/// The rewriter thread replays every entry through a single
+/// `IOCTL_WRITE_MEMORY_BATCH` per sweep; the kernel driver keeps no lock
+/// state and performs no background writes of its own.
 #[derive(Clone)]
 struct LockEntry {
     pid: u64,
@@ -609,6 +608,10 @@ struct LockEntry {
 }
 
 static LOCKS: OnceLock<Mutex<Vec<LockEntry>>> = OnceLock::new();
+
+/// Bumped on every table mutation so the rewriter can cache the encoded
+/// batch buffer and only re-encode after actual changes.
+static LOCKS_VERSION: AtomicU64 = AtomicU64::new(0);
 
 fn lock_table() -> &'static Mutex<Vec<LockEntry>> {
     LOCKS.get_or_init(|| Mutex::new(Vec::new()))
@@ -635,6 +638,7 @@ fn lock_insert(pid: u64, address: u64, data: &[u8]) -> Result<(), DriverError> {
             data: data.to_vec(),
         });
     }
+    LOCKS_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -643,6 +647,7 @@ fn lock_remove(pid: u64, address: u64) {
         .lock()
         .expect("lock table poisoned")
         .retain(|entry| !(entry.pid == pid && entry.address == address));
+    LOCKS_VERSION.fetch_add(1, Ordering::Release);
 }
 
 fn lock_clear(pid: u64) {
@@ -650,20 +655,12 @@ fn lock_clear(pid: u64) {
         .lock()
         .expect("lock table poisoned")
         .retain(|entry| entry.pid != pid);
+    LOCKS_VERSION.fetch_add(1, Ordering::Release);
 }
 
-fn lock_snapshot() -> Vec<LockEntry> {
-    lock_table().lock().expect("lock table poisoned").clone()
-}
-
-/// Pause between rewrite sweeps. ZERO means pure spin: sweeps run back to
-/// back at full speed (each `IOCTL_WRITE_MEMORY` round trip paces the loop),
-/// which maximizes rewrite frequency at the cost of one busy core.
-const LOCK_REWRITE_INTERVAL: Duration = Duration::ZERO;
-
-/// Rewrites every active lock entry through the normal driver write path in
-/// a tight dedicated loop (~1000 sweeps/s). Runs on its own OS thread so the
-/// sweep cost is a single core and no Tokio task dispatch is paid per tick.
+/// Rewrites every active lock entry through the batch write IOCTL in a
+/// continuous spin. Runs on its own OS thread; it also runs at BELOW_NORMAL
+/// priority so the spinning thread can never starve the game or the service.
 /// Exits when the service shuts down. Write failures are ignored: a vanished
 /// process or freed page simply skips the entry.
 pub async fn run_lock_worker(
@@ -674,7 +671,17 @@ pub async fn run_lock_worker(
     let thread_stop = Arc::clone(&stop);
     let thread = std::thread::Builder::new()
         .name("ks-lock-rewriter".to_owned())
-        .spawn(move || lock_rewrite_loop(Arc::clone(&handle), thread_stop))
+        .spawn(move || {
+            // BELOW_NORMAL keeps this spinning thread scheduler-friendly:
+            // any normal-priority ready thread preempts it immediately.
+            unsafe {
+                windows_sys::Win32::System::Threading::SetThreadPriority(
+                    windows_sys::Win32::System::Threading::GetCurrentThread(),
+                    windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL,
+                );
+            }
+            lock_rewrite_loop(Arc::clone(&handle), thread_stop)
+        })
         .expect("failed to spawn lock rewriter thread");
     let _ = shutdown.recv().await;
     stop.store(true, std::sync::atomic::Ordering::Release);
@@ -682,15 +689,159 @@ pub async fn run_lock_worker(
 }
 
 fn lock_rewrite_loop(handle: Arc<DriverHandle>, stop: Arc<std::sync::atomic::AtomicBool>) {
-    use std::sync::atomic::Ordering;
+    let mut buffers = BatchWriteBuffers::new();
     while !stop.load(Ordering::Acquire) {
-        for entry in &lock_snapshot() {
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            let _ = write_memory(&handle, entry.pid, entry.address, &entry.data);
+        // Fast path: the table is unchanged, so the previously encoded
+        // request is submitted as-is — no clone, no re-encode, no table
+        // lock. Only actual lock mutations trigger a re-encode.
+        buffers.sync();
+        if buffers.count() > 0 {
+            buffers.submit(&handle);
         }
-        std::thread::sleep(LOCK_REWRITE_INTERVAL);
+    }
+}
+
+const BATCH_WRITE_HEADER: usize = 8;
+const BATCH_WRITE_ENTRY_HEADER: usize = 24;
+
+/// Builds a batch-write request body (count + per-entry
+/// `pid, address, size, pad, data`).
+fn encode_batch_write(entries: &[(u64, u64, &[u8])]) -> Vec<u8> {
+    let data_bytes: usize = entries.iter().map(|(_, _, data)| data.len()).sum();
+    let mut input = Vec::with_capacity(
+        BATCH_WRITE_HEADER + BATCH_WRITE_ENTRY_HEADER * entries.len() + data_bytes,
+    );
+    input.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    input.extend_from_slice(&0u32.to_le_bytes());
+    for (pid, address, data) in entries {
+        input.extend_from_slice(&pid.to_le_bytes());
+        input.extend_from_slice(&address.to_le_bytes());
+        input.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        input.extend_from_slice(&0u32.to_le_bytes());
+        input.extend_from_slice(data);
+    }
+    input
+}
+
+/// One-shot batch write used by the script-facing `batch_write` API: every
+/// entry shares `pid` and is written in a single kernel transition.
+/// Returns one NTSTATUS per entry.
+pub fn batch_write_entries(
+    handle: &DriverHandle,
+    pid: u64,
+    entries: &[(u64, Vec<u8>)],
+) -> Result<Vec<u32>, DriverError> {
+    if entries.is_empty() || entries.len() > MAX_BATCH_WRITE_ENTRIES || pid == 0 {
+        return Err(DriverError::ResponseParseFailed);
+    }
+    let borrowed: Vec<(u64, u64, &[u8])> = entries
+        .iter()
+        .map(|(address, data)| (pid, *address, data.as_slice()))
+        .collect();
+    let input = encode_batch_write(&borrowed);
+    let mut output = vec![0u8; 4 + entries.len() * 4];
+    let mut returned = 0u32;
+    let ok = unsafe {
+        windows_sys::Win32::System::IO::DeviceIoControl(
+            handle.0,
+            IOCTL_WRITE_MEMORY_BATCH,
+            input.as_ptr() as *const _,
+            input.len() as u32,
+            output.as_mut_ptr() as *mut _,
+            output.len() as u32,
+            &mut returned,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(DriverError::IoctlFailed(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
+    }
+    let count = u32::from_le_bytes(output[..4].try_into().unwrap()) as usize;
+    Ok(output[4..4 + count * 4]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
+/// Persistent re-encode cache for the lock sweep. The encoded
+/// `IOCTL_WRITE_MEMORY_BATCH` request only depends on the lock table
+/// contents, so it is rebuilt lazily after a version bump and reused for
+/// every sweep in between.
+struct BatchWriteBuffers {
+    encoded_version: u64,
+    count: usize,
+    input: Vec<u8>,
+    output: Vec<u8>,
+}
+
+impl BatchWriteBuffers {
+    fn new() -> Self {
+        Self {
+            encoded_version: u64::MAX,
+            count: 0,
+            input: Vec::new(),
+            output: Vec::new(),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Re-encodes the request when the lock table changed since the last
+    /// encode. The table mutex is only taken on that slow path.
+    fn sync(&mut self) {
+        let current = LOCKS_VERSION.load(Ordering::Acquire);
+        if current == self.encoded_version {
+            return;
+        }
+        let table = lock_table().lock().expect("lock table poisoned");
+        self.count = table.len().min(MAX_BATCH_WRITE_ENTRIES);
+        let data_bytes: usize = table.iter().take(self.count).map(|e| e.data.len()).sum();
+        self.input.clear();
+        self.input
+            .reserve(BATCH_WRITE_HEADER + BATCH_WRITE_ENTRY_HEADER * self.count + data_bytes);
+        self.input
+            .extend_from_slice(&(self.count as u32).to_le_bytes());
+        self.input.extend_from_slice(&0u32.to_le_bytes());
+        for entry in table.iter().take(self.count) {
+            self.input.extend_from_slice(&entry.pid.to_le_bytes());
+            self.input.extend_from_slice(&entry.address.to_le_bytes());
+            self.input
+                .extend_from_slice(&(entry.data.len() as u32).to_le_bytes());
+            self.input.extend_from_slice(&0u32.to_le_bytes());
+            self.input.extend_from_slice(&entry.data);
+        }
+        self.output.clear();
+        self.output.resize(4 + self.count * 4, 0);
+        // Read the version again after encoding: a mutation that raced this
+        // encode bumped it and the next sweep re-encodes.
+        self.encoded_version = LOCKS_VERSION.load(Ordering::Acquire);
+    }
+
+    /// Submits the cached request. Per-entry write failures are ignored by
+    /// the sweep (a vanished process or freed page simply skips the entry),
+    /// but a transport-level failure is logged.
+    fn submit(&mut self, handle: &DriverHandle) {
+        let mut returned = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::System::IO::DeviceIoControl(
+                handle.0,
+                IOCTL_WRITE_MEMORY_BATCH,
+                self.input.as_ptr() as *const _,
+                self.input.len() as u32,
+                self.output.as_mut_ptr() as *mut _,
+                self.output.len() as u32,
+                &mut returned,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            tracing::debug!(error, entries = self.count, "lock batch write failed");
+        }
     }
 }
 

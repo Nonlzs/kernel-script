@@ -21,8 +21,45 @@ pub const IOCTL_READ_MEMORY_MDL_RVA: u32 = 0x0022_202C;
 pub const IOCTL_WRITE_MEMORY_MDL_RVA: u32 = 0x0022_2030;
 pub const IOCTL_BATCH_READ_MEMORY: u32 = 0x0022_2034;
 pub const IOCTL_TRAVERSE_POINTER_CHAIN: u32 = 0x0022_2038;
+pub const IOCTL_WRITE_MEMORY_BATCH: u32 = 0x0022_203C;
+pub const MAX_BATCH_WRITE_ENTRIES: usize = 64;
 pub const MAX_MEMORY_LOCK_SIZE: usize = 4096;
 pub const MAX_MEMORY_LOCKS: usize = 64;
+
+/// `IOCTL_WRITE_MEMORY_BATCH` input wire layout (little-endian):
+/// `u32 count`, `u32 reserved`, then `count` entries of
+/// `u64 process_id, u64 address, u32 size, u32 _pad, size bytes of data`.
+/// Output layout: `u32 count`, then `count` little-endian `u32` NTSTATUS
+/// values, one per entry in input order. A malformed boundary aborts the
+/// walk; all unprocessed entries report `STATUS_INVALID_PARAMETER`.
+
+/// Validates a pipe-level batch-write entries payload (`u64 address, u32
+/// size, u32 pad, data[size]` per entry) and returns the entry count. The
+/// leading `u64 pid` is not part of `entries`.
+fn batch_write_entry_count(entries: &[u8]) -> Option<usize> {
+    if entries.len() < 16 {
+        return None;
+    }
+    let count = u32::from_le_bytes(entries[8..12].try_into().ok()?) as usize;
+    if count == 0 || count > MAX_BATCH_WRITE_ENTRIES {
+        return None;
+    }
+    let mut offset = 16usize;
+    for _ in 0..count {
+        if entries.len() - offset < 16 {
+            return None;
+        }
+        let size = u32::from_le_bytes(entries[offset + 8..offset + 12].try_into().ok()?) as usize;
+        if size == 0 || size > MAX_DRIVER_TRANSFER_SIZE {
+            return None;
+        }
+        offset = offset.checked_add(16)?.checked_add(size)?;
+    }
+    if offset != entries.len() {
+        return None;
+    }
+    Some(count)
+}
 
 #[repr(C)]
 pub struct MemoryReadRequest {
@@ -176,6 +213,12 @@ pub enum Request<'a> {
         size: u32,
         addresses: &'a [u8],
     },
+    /// Entries payload: per entry `u64 address, u32 size, u32 _pad,
+    /// data[size]`, all little-endian. All entries share `pid`.
+    BatchWrite {
+        pid: u64,
+        entries: &'a [u8],
+    },
     TraversePointerChain {
         pid: u64,
         base: u64,
@@ -215,6 +258,8 @@ pub enum Response<'a> {
     ProcessId(u64),
     ProcessBase(u64),
     BatchReadMemory(&'a [u8]),
+    /// One little-endian NTSTATUS per entry, in input order.
+    BatchWriteStatuses(&'a [u8]),
     PointerChainResult(u64),
     LockComplete,
 }
@@ -320,6 +365,7 @@ impl<'a> WireEncode for Request<'a> {
             Self::ReadProcessMemory(_) => MessageType::ReadProcessMemory,
             Self::WriteProcessMemory { .. } => MessageType::WriteProcessMemory,
             Self::BatchReadMemory { .. } => MessageType::BatchReadMemory,
+            Self::BatchWrite { .. } => MessageType::BatchWriteMemory,
             Self::TraversePointerChain { .. } => MessageType::TraversePointerChain,
             Self::LockMemory { .. } => MessageType::LockMemory,
             Self::UnlockMemory { .. } => MessageType::UnlockMemory,
@@ -357,6 +403,12 @@ impl<'a> WireEncode for Request<'a> {
                 }
                 16usize
                     .checked_add(addresses.len())
+                    .ok_or(ProtocolError::TooLarge)?
+            }
+            Self::BatchWrite { entries, .. } => {
+                batch_write_entry_count(entries).ok_or(ProtocolError::InvalidPayload)?;
+                16usize
+                    .checked_add(entries.len())
                     .ok_or(ProtocolError::TooLarge)?
             }
             Self::TraversePointerChain { offsets, .. } => {
@@ -475,6 +527,14 @@ impl<'a> WireEncode for Request<'a> {
                 let count = (addresses.len() / 8) as u32;
                 out[22..26].copy_from_slice(&count.to_le_bytes());
                 out[26..total].copy_from_slice(addresses);
+            }
+            Self::BatchWrite { pid, entries } => {
+                let count =
+                    batch_write_entry_count(entries).ok_or(ProtocolError::InvalidPayload)?;
+                out[10..18].copy_from_slice(&pid.to_le_bytes());
+                out[18..22].copy_from_slice(&(count as u32).to_le_bytes());
+                out[22..26].copy_from_slice(&0u32.to_le_bytes());
+                out[26..total].copy_from_slice(entries);
             }
             Self::TraversePointerChain { pid, base, offsets } => {
                 out[10..18].copy_from_slice(&pid.to_le_bytes());
@@ -619,6 +679,13 @@ impl<'a> WireDecode<'a> for Request<'a> {
                     addresses: &p[16..],
                 })
             }
+            MessageType::BatchWriteMemory if p.len() >= 16 => {
+                batch_write_entry_count(p).ok_or(ProtocolError::InvalidPayload)?;
+                Ok(Self::BatchWrite {
+                    pid: u64::from_le_bytes(p[..8].try_into().unwrap()),
+                    entries: &p[16..],
+                })
+            }
             MessageType::TraversePointerChain if p.len() >= 20 => {
                 let pid = u64::from_le_bytes(p[..8].try_into().unwrap());
                 let base = u64::from_le_bytes(p[8..16].try_into().unwrap());
@@ -683,6 +750,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessId(_) => MessageType::GetProcessIdResponse,
             Self::ProcessBase(_) => MessageType::GetProcessBaseResponse,
             Self::BatchReadMemory(_) => MessageType::BatchReadMemoryResponse,
+            Self::BatchWriteStatuses(_) => MessageType::BatchWriteMemoryResponse,
             Self::PointerChainResult(_) => MessageType::TraversePointerChainResponse,
             Self::LockComplete => MessageType::LockMemoryResponse,
         }
@@ -697,6 +765,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessId(_) => 8,
             Self::ProcessBase(_) => 8,
             Self::BatchReadMemory(v) => v.len(),
+            Self::BatchWriteStatuses(v) => v.len(),
             Self::PointerChainResult(_) => 8,
             Self::LockComplete => 0,
         };
@@ -726,6 +795,7 @@ impl<'a> WireEncode for Response<'a> {
             Self::ProcessId(pid) => out[10..18].copy_from_slice(&pid.to_le_bytes()),
             Self::ProcessBase(base) => out[10..18].copy_from_slice(&base.to_le_bytes()),
             Self::BatchReadMemory(v) => out[10..total].copy_from_slice(v),
+            Self::BatchWriteStatuses(v) => out[10..total].copy_from_slice(v),
             Self::PointerChainResult(addr) => out[10..18].copy_from_slice(&addr.to_le_bytes()),
             Self::LockComplete => {}
         }
@@ -753,6 +823,11 @@ impl<'a> WireDecode<'a> for Response<'a> {
                 u64::from_le_bytes(payload.try_into().unwrap()),
             )),
             MessageType::BatchReadMemoryResponse => Ok(Self::BatchReadMemory(payload)),
+            MessageType::BatchWriteMemoryResponse
+                if !payload.is_empty() && payload.len() % 4 == 0 =>
+            {
+                Ok(Self::BatchWriteStatuses(payload))
+            }
             MessageType::TraversePointerChainResponse if payload.len() == 8 => Ok(
                 Self::PointerChainResult(u64::from_le_bytes(payload.try_into().unwrap())),
             ),

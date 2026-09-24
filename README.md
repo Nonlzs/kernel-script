@@ -38,10 +38,17 @@ Luau script
 - Luau JIT scripts with hot reload and per-callback execution budgets.
 - Synchronous process lookup, module-base lookup, memory read/write, RVA, MDL,
   batch-read, and pointer-chain APIs.
+- Script config persistence through a `config` API (`config.json`).
+- Keyboard input API (`is_key_down` / `is_key_up` / `is_key_press`) that works
+  while the game owns input focus.
+- Continuous memory locks: the service replays every lock through one batch
+  write IOCTL per sweep.
 - EgUI/GLFW transparent overlay with cached draw commands.
 - User-mode process enumeration in `ks-service`.
 - SYSTEM-only driver device access with first-opener process binding.
 - Explicit little-endian framed IPC protocol shared through `ks-core`.
+- Launcher randomizes SCM service names per start and restores the canonical
+  component file names after a full stop.
 
 ## Workspace Structure
 
@@ -70,7 +77,8 @@ kernel-script/
 │   └── src/
 │       ├── app.rs               # overlay application and frame rendering
 │       ├── lua_runtime.rs       # Lua VM lifecycle and API registration
-│       ├── lua_runtime/         # engine API, execution, and runtime types
+│       ├── lua_runtime/         # engine API, execution, keyboard, and runtime types
+│       ├── config_store.rs      # Lua config persistence (config.json)
 │       ├── overlay.rs            # generic draw-command painter bridge
 │       ├── sync_ipc.rs          # synchronous Named Pipe client
 │       └── window_util.rs       # target-window geometry lookup
@@ -92,7 +100,7 @@ function OnDestroy() end
 
 - `OnStart` runs once after loading.
 - `OnUpdate` is the only per-frame callback. The whole overlay (rendering plus
-  OnUpdate) is capped at 100 Hz; a slow callback simply lowers the frame rate.
+  OnUpdate) is capped at 60 Hz; a slow callback simply lowers the frame rate.
   It performs calculations, optional synchronous memory operations, UI calls,
   and drawing in one Lua invocation. Budgets are advisory warnings, never
   errors.
@@ -100,8 +108,13 @@ function OnDestroy() end
   next frame, so scripts should keep work bounded.
 - `OnDestroy` runs during hot reload and shutdown.
 
-All memory functions are synchronous and execute on the GUI Lua thread. See
-`document.md` or `document_CN.md` for the complete API reference.
+All memory functions are synchronous and execute on the GUI Lua thread. The
+full API surface includes `memory.*` (read/write, RVA, MDL, batch read,
+pointer chain, locks), `keyboard.*` (`is_key_down`, `is_key_up`,
+`is_key_press` — works without window focus), `config.*` (persisted
+`config.json` entries), `ui.*` (egui widgets), `draw.*` (overlay drawing),
+and `engine.*` (timing and pause control). See `document.md` or
+`document_CN.md` for the complete API reference.
 
 ## Build And Test
 

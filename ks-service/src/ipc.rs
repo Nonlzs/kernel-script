@@ -328,6 +328,32 @@ fn dispatch_sync(
                 addresses: parsed,
             }
         }
+        Request::BatchWrite { pid, entries } => {
+            // Wire entries: u64 address, u32 size, u32 pad, data[size].
+            let mut parsed = Vec::new();
+            let mut offset = 0usize;
+            loop {
+                if offset == entries.len() {
+                    break;
+                }
+                if entries.len() - offset < 16 {
+                    return encode_response(Response::Error(1));
+                }
+                let address = u64::from_le_bytes(entries[offset..offset + 8].try_into().unwrap());
+                let size = u32::from_le_bytes(entries[offset + 8..offset + 12].try_into().unwrap())
+                    as usize;
+                offset += 16;
+                if size == 0 || entries.len() - offset < size {
+                    return encode_response(Response::Error(1));
+                }
+                parsed.push((address, entries[offset..offset + size].to_vec()));
+                offset += size;
+            }
+            OwnedRequest::BatchWrite {
+                pid,
+                entries: parsed,
+            }
+        }
         Request::TraversePointerChain { pid, base, offsets } => {
             if offsets.is_empty() || offsets.len() % 8 != 0 {
                 return encode_response(Response::Error(1));
@@ -499,6 +525,21 @@ fn dispatch_sync(
                 encode_error_detail(&error)
             }
         },
+        OwnedRequest::BatchWrite { pid, entries } => {
+            match driver_comm::batch_write_entries(handle, pid, &entries) {
+                Ok(statuses) => {
+                    let mut bytes = Vec::with_capacity(statuses.len() * 4);
+                    for status in statuses {
+                        bytes.extend_from_slice(&status.to_le_bytes());
+                    }
+                    encode_response(Response::BatchWriteStatuses(&bytes))
+                }
+                Err(error) => {
+                    tracing::error!(pid, entries = entries.len(), %error, "driver batch write failed");
+                    encode_error_detail(&error)
+                }
+            }
+        }
         OwnedRequest::TraversePointerChain { pid, base, offsets } => {
             match driver_comm::traverse_pointer_chain(handle, pid, base, &offsets) {
                 Ok(result) => encode_response(Response::PointerChainResult(result)),
@@ -608,6 +649,10 @@ enum OwnedRequest {
         pid: u64,
         size: u32,
         addresses: Vec<u64>,
+    },
+    BatchWrite {
+        pid: u64,
+        entries: Vec<(u64, Vec<u8>)>,
     },
     TraversePointerChain {
         pid: u64,

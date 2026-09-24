@@ -318,6 +318,33 @@ pub fn batch_read(pid: u64, size: u32, addresses: &[u64]) -> Result<Vec<u8>, Str
     }
 }
 
+/// Writes every (address, data) entry for `pid` in one service round trip.
+/// Returns one flag per entry: true when the driver reported success.
+pub fn batch_write(pid: u64, entries: &[(u64, Vec<u8>)]) -> Result<Vec<bool>, String> {
+    let mut entries_raw = Vec::new();
+    for (address, data) in entries {
+        entries_raw.extend_from_slice(&address.to_le_bytes());
+        entries_raw.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        entries_raw.extend_from_slice(&0u32.to_le_bytes());
+        entries_raw.extend_from_slice(data);
+    }
+    let resp = ipc_send(&Request::BatchWrite {
+        pid,
+        entries: &entries_raw,
+    })?;
+    match decode_ok(&resp)? {
+        Response::BatchWriteStatuses(bytes) => {
+            let mut flags = Vec::with_capacity(bytes.len() / 4);
+            for chunk in bytes.chunks_exact(4) {
+                flags.push(u32::from_le_bytes(chunk.try_into().unwrap()) == 0);
+            }
+            Ok(flags)
+        }
+        Response::Error(code) => Err(format!("service error: {code}")),
+        _ => Err("unexpected response".into()),
+    }
+}
+
 pub fn traverse_pointer_chain(pid: u64, base: u64, offsets: &[u64]) -> Result<u64, String> {
     let mut offsets_raw = Vec::with_capacity(offsets.len() * 8);
     for &off in offsets {

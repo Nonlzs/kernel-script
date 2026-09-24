@@ -23,8 +23,10 @@ end
 Notes:
 
 - `OnStart` is called once after the script is loaded.
-- `OnUpdate` is the only per-frame callback. The overlay frame rate is capped at 100 Hz.
+- `OnUpdate` is the only per-frame callback. The overlay frame rate is capped at 60 Hz.
 - UI and draw APIs are available during `OnUpdate`.
+- Keyboard state is snapshotted once per frame before `OnUpdate`; queries and
+  press latches are consistent within a frame.
 - `OnDestroy` is called on hot-reload or GUI exit.
 - All memory API calls are synchronous and block the Lua thread for ~60-100μs.
 - Do not call memory APIs inside `ui.window` callbacks if latency is critical.
@@ -198,6 +200,52 @@ Constraints:
 - Writes are debounced (at most one write per second) and atomic
   (temp file + rename); a crash never leaves a half-written file.
 
+## Keyboard Input API
+
+Keyboard queries read the physical key state of the whole desktop
+(`GetAsyncKeyState`), so they work while another window owns input focus.
+The engine snapshots all keys once per frame; `is_key_press` reports a
+down-edge since the previous frame (60 Hz detection granularity).
+
+`key` accepts a name or a raw virtual-key code (integer 0–255). Recognized
+names: `"a"`–`"z"`, `"0"`–`"9"`, `"f1"`–`"f24"`, `"space"`, `"tab"`,
+`"enter"`/`"return"`, `"backspace"`/`"back"`, `"escape"`/`"esc"`,
+`"shift"`/`"lshift"`/`"rshift"`, `"ctrl"`/`"lctrl"`/`"rctrl"`,
+`"alt"`/`"lalt"`/`"ralt"`, `"insert"`/`"ins"`, `"delete"`/`"del"`,
+`"home"`, `"end"`, `"pageup"`, `"pagedown"`, `"up"`, `"down"`, `"left"`,
+`"right"`, `"capslock"`, `"pause"`, `"lwin"`, `"rwin"`, `"numpad0"`–
+`"numpad9"`, `"multiply"`, `"add"`, `"subtract"`, `"divide"`,
+`"decimal"`, and mouse buttons `"mouse1"`–`"mouse5"` (also
+`"lbutton"`, `"rbutton"`, `"mbutton"`, `"xbutton1"`, `"xbutton2"`).
+
+### keyboard.is_key_down
+
+```lua
+if keyboard.is_key_down("f") then
+    -- held right now
+end
+```
+
+### keyboard.is_key_up
+
+```lua
+if keyboard.is_key_up("shift") then
+    -- not held
+end
+```
+
+### keyboard.is_key_press
+
+True when a full press-then-release cycle was observed since the last call.
+The flag latches across frames and is **consumed when read**, so a single
+press fires exactly once — ideal for toggles.
+
+```lua
+if keyboard.is_key_press("mouse2") then
+    aimbot_enabled = not aimbot_enabled
+end
+```
+
 ## Memory Lock API
 
 Memory lock maintains a periodic write that continuously rewrites a byte
@@ -207,16 +255,15 @@ are identified by a composite key
 without creating a duplicate entry.
 
 The lock table lives in `ks-service`: a dedicated rewrite thread replays
-every entry through the normal write path (`IOCTL_WRITE_MEMORY`) in a pure
-spin — back-to-back sweeps paced only by the IOCTL round trip (tens of
-thousands of writes per second, one busy core). The driver keeps no lock
-state. The table supports up to 64 entries, each 1–4096 bytes. All writes
-use the same kernel primitive as ordinary `memory.write_*` calls.
+every entry through one batch write (`IOCTL_WRITE_MEMORY_BATCH`) in a
+continuous spin. The driver keeps no
+lock state. The table supports up to 64 entries, each 1–4096 bytes. All
+writes use the same kernel primitive as ordinary `memory.write_*` calls.
 
 ### memory.lock
 
 Locks a byte pattern to an absolute address. The service rewrites `data` to
-`address` in the target process continuously (pure spin) until unlocked.
+`address` in the target process continuously until unlocked.
 
 ```lua
 memory.lock(pid, address, {0x90, 0x90, 0x90, 0xC3})
@@ -362,6 +409,33 @@ print(addr)
 
 **Maximum offsets**: 32 per call. Returns `0` if any pointer in the chain is
 null or unreadable.
+
+### Example: Zero-Allocation Entity Scan
+
+## Batch Write API
+
+### memory.batch_write
+
+Applies multiple writes in one service round trip and one kernel transition
+(`IOCTL_WRITE_MEMORY_BATCH`): one process lookup for the whole batch, one
+NTSTATUS per entry.
+
+```lua
+local results = memory.batch_write(pid, {
+    { address = "0x7FF812345000", data = {0x90, 0x90} },
+    { address = "0x7FF812345100", data = {1, 2, 3, 4} },
+    { address = base + offset,    data = {0xE9} },
+})
+-- results[i] is true when entry i was written successfully
+```
+
+Constraints:
+
+- 1–64 entries per call (`MAX_BATCH_WRITE_ENTRIES`).
+- Each `data` is 1–4096 bytes.
+- `address` accepts the same forms as other memory APIs (decimal number or
+  hex string).
+- Entries execute in input order; a failed entry does not stop the others.
 
 ### Example: Zero-Allocation Entity Scan
 
@@ -710,7 +784,8 @@ can comfortably fit 100+ synchronous memory reads per frame.
 - All memory API calls are synchronous and block the Lua thread for ~60-100μs.
 - Single memory read/write limit: 4096 bytes.
 - Batch read limit: 256 entries, 4096 bytes total.
-- Memory lock limit: 64 entries, 4096 bytes per entry, 10ms write interval.
+- Memory lock limit: 64 entries, 4096 bytes per entry; rewritten continuously
+  through one batch write IOCTL per sweep.
 - Process list is enumerated in user mode by the service.
 - Memory read/write and RVA computation are performed by the driver.
 - Window rect enumeration runs in the GUI process (user session).

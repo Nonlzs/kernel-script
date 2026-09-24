@@ -112,6 +112,71 @@ pub fn write_process_memory_mdl(
     })
 }
 
+/// One prepared batch-write entry. `data` must point into memory that stays
+/// valid for the duration of the call (the METHOD_BUFFERED system buffer).
+#[derive(Clone, Copy)]
+pub struct BatchWriteEntry {
+    pub process_id: u64,
+    pub address: u64,
+    pub data: *const u8,
+    pub len: usize,
+}
+
+/// Writes every entry in one pass, resolving each distinct process only
+/// once: `PsLookupProcessByProcessId` per entry dominated the batch cost
+/// when all locks target the same game. Entries with invalid parameters or
+/// a failed lookup are skipped and their status slot reports why.
+///
+/// Safety: every `data` pointer must be valid for `len` bytes, and each
+/// address must be a user-mode address in the entry's target process.
+pub unsafe fn batch_write_process_memory(entries: &[BatchWriteEntry], statuses: &mut [NTSTATUS]) {
+    let mut cached: Option<(u64, ProcessRef)> = None;
+    for (entry, slot) in entries.iter().zip(statuses.iter_mut()) {
+        if entry.process_id == 0
+            || entry.address == 0
+            || entry.len == 0
+            || entry.len > MAX_DRIVER_TRANSFER_SIZE
+        {
+            *slot = STATUS_INVALID_PARAMETER;
+            continue;
+        }
+        let cached_same = matches!(
+            cached.as_ref(),
+            Some((pid, _)) if *pid == entry.process_id
+        );
+        if !cached_same {
+            match lookup(entry.process_id) {
+                Ok(process) => cached = Some((entry.process_id, process)),
+                Err(status) => {
+                    cached = None;
+                    *slot = status;
+                    continue;
+                }
+            }
+        }
+        let process = match cached.as_ref() {
+            Some((_, process)) => process.0,
+            None => unreachable!("process cached above"),
+        };
+        let data = core::slice::from_raw_parts(entry.data, entry.len);
+        let mut copied = 0usize;
+        let status = ks_write_process_memory(
+            process,
+            data.as_ptr() as Pvoid,
+            entry.address as Pvoid,
+            entry.len,
+            &mut copied,
+        );
+        *slot = if !nt_success(status) {
+            status
+        } else if copied == entry.len {
+            STATUS_SUCCESS
+        } else {
+            STATUS_ACCESS_VIOLATION
+        };
+    }
+}
+
 pub fn read_process_memory(
     process_id: u64,
     address: u64,

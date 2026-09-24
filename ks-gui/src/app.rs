@@ -73,7 +73,7 @@ impl EguiOverlay for KernelScriptApp {
         glfw_backend: &mut GlfwBackend,
     ) {
         // The overlay has no ordinary widget invalidation to drive repainting.
-        // Cap the whole overlay (render + OnUpdate) at 100 FPS so egui windows
+        // Cap the whole overlay (render + OnUpdate) at 60 FPS so egui windows
         // stay stable and slow Lua callbacks simply lower the frame rate.
         ctx.request_repaint_after(crate::lua_runtime::FRAME_INTERVAL);
         // Insert toggles the egui script windows only; Lua keeps running and

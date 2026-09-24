@@ -30,6 +30,8 @@ pub enum MessageType {
     LockMemoryResponse = 26,
     LockMemoryRva = 27,
     UnlockMemoryRva = 28,
+    BatchWriteMemory = 29,
+    BatchWriteMemoryResponse = 30,
     Error = 0xFFFF,
     ErrorDetail = 0xFFFE,
 }
@@ -64,6 +66,8 @@ impl MessageType {
             26 => Ok(Self::LockMemoryResponse),
             27 => Ok(Self::LockMemoryRva),
             28 => Ok(Self::UnlockMemoryRva),
+            29 => Ok(Self::BatchWriteMemory),
+            30 => Ok(Self::BatchWriteMemoryResponse),
             0xFFFF => Ok(Self::Error),
             0xFFFE => Ok(Self::ErrorDetail),
             _ => Err(ProtocolError::UnknownMessageType),

@@ -34,10 +34,15 @@ Luau 脚本
 
 - Luau JIT、脚本热重载和生命周期回调执行预算。
 - 同步进程查找、模块基址、内存读写、RVA、MDL、批量读取和指针链 API。
+- 通过 `config` API 持久化脚本配置（`config.json`）。
+- 键盘输入 API（`is_key_down` / `is_key_up` / `is_key_press`），游戏持有
+  输入焦点时同样有效。
+- 持续内存锁：service 每轮 sweep 用一次批量写 IOCTL 重放全部锁。
 - EgUI/GLFW 透明覆盖层和缓存绘制命令。
 - `ks-service` 在用户态使用 Toolhelp 枚举进程。
 - SYSTEM-only driver 设备访问和首次打开进程绑定。
 - `ks-core` 提供显式小端序的分帧 IPC 协议。
+- launcher 每次启动随机化 SCM 服务名，全部停止后恢复组件原始文件名。
 
 ## 工作区结构
 
@@ -55,7 +60,7 @@ kernel-script/
 ├── ks-service/                 # SYSTEM service 和 IPC
 │   └── src/{main.rs,driver_comm.rs,ipc.rs,process.rs}
 ├── ks-gui/                    # overlay、Luau 和同步 IPC
-│   └── src/{app.rs,lua_runtime.rs,lua_runtime/,overlay.rs,sync_ipc.rs,window_util.rs}
+│   └── src/{app.rs,lua_runtime.rs,lua_runtime/,config_store.rs,overlay.rs,sync_ipc.rs,window_util.rs}
 ├── ks-launcher/               # 三步启动器
 └── ks-test/                   # 独立 IPC benchmark 客户端
 ```
@@ -71,13 +76,17 @@ function OnDestroy() end
 ```
 
 - `OnStart` 在加载后执行一次。
-- `OnUpdate` 是唯一的每帧回调。整个覆盖层（渲染 + OnUpdate）帧率封顶 100Hz；
+- `OnUpdate` 是唯一的每帧回调。整个覆盖层（渲染 + OnUpdate）帧率封顶 60Hz；
   回调变慢只会降低帧率。它在一次调用中完成计算、同步内存操作、UI 和绘制。
   预算超时仅记录告警，不会报错。
 - 回调运行在 GUI Lua 线程；较长的同步 IPC 仍会延迟下一帧，因此脚本应限制单次工作量。
 - `OnDestroy` 在热重载和退出时执行。
 
-所有 memory API 都是同步调用，并在 GUI Lua 线程执行。完整 API 见
+所有 memory API 都是同步调用，并在 GUI Lua 线程执行。完整 API 面包括
+`memory.*`（读写、RVA、MDL、批量读取、指针链、内存锁）、`keyboard.*`
+（`is_key_down`、`is_key_up`、`is_key_press`——无窗口焦点时同样有效）、
+`config.*`（`config.json` 持久化配置）、`ui.*`（egui 控件）、`draw.*`
+（覆盖层绘制）和 `engine.*`（计时与暂停控制）。完整 API 见
 `document_CN.md` 或英文版 `document.md`。
 
 ## 构建和测试

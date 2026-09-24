@@ -9,6 +9,7 @@ use mlua::{Function, Lua, Table, Value};
 
 mod engine_api;
 mod execution;
+mod keyboard;
 mod types;
 
 use crate::config_store::SharedConfigStore;
@@ -35,8 +36,8 @@ const UPDATE_BUDGET: Duration = Duration::from_millis(20);
 const DESTROY_BUDGET: Duration = Duration::from_millis(50);
 const UPDATE_HEALTHY_FRAMES_TO_CLEAR_ERROR: u32 = 30;
 
-/// Overlay frame interval: the maximum GUI frame rate (100 Hz).
-pub const FRAME_INTERVAL: Duration = Duration::from_nanos(10_000_000);
+/// Overlay frame interval: the maximum GUI frame rate (60 Hz).
+pub const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 pub struct LuaRuntime {
     lua: Lua,
@@ -50,6 +51,7 @@ pub struct LuaRuntime {
     script_modified: Option<SystemTime>,
     draw_commands: DrawCommands,
     config: SharedConfigStore,
+    keyboard: keyboard::SharedKeyboardState,
 }
 
 pub struct LuaRuntimeManager {
@@ -130,11 +132,13 @@ impl LuaRuntime {
         config: SharedConfigStore,
     ) -> mlua::Result<Self> {
         let control = Arc::new(RuntimeControl::default());
+        let keyboard = Arc::new(Mutex::new(keyboard::KeyboardState::new()));
         let (lua, deadline) = Self::build_vm(
             &script_path,
             Arc::clone(&control),
             Arc::clone(&draw_commands),
             Arc::clone(&config),
+            Arc::clone(&keyboard),
         )?;
         let now = Instant::now();
         Ok(Self {
@@ -149,11 +153,15 @@ impl LuaRuntime {
             last_tick: now,
             last_reload_poll: now,
             config,
+            keyboard,
         })
     }
 
     fn frame(&mut self, ctx: &egui::Context, now: Instant, ui_visible: bool) {
         self.check_hot_reload(now);
+        // Snapshot all keys once per frame so is_key_press reports a stable
+        // down-edge for the duration of OnUpdate.
+        self.keyboard.lock().unwrap().begin_frame();
         self.run_updates(ctx, now, ui_visible);
         if let Err(error) = self.lua.gc_step() {
             self.last_error = Some(format!("Lua GC error: {error}"));
@@ -169,6 +177,7 @@ impl LuaRuntime {
         control: Arc<RuntimeControl>,
         draw_commands: DrawCommands,
         config: SharedConfigStore,
+        keyboard: keyboard::SharedKeyboardState,
     ) -> mlua::Result<(Lua, Arc<AtomicU64>)> {
         let lua = Lua::new();
         lua.set_memory_limit(LUA_MEMORY_LIMIT)?;
@@ -181,6 +190,7 @@ impl LuaRuntime {
         register_memory_api(&lua)?;
         register_draw_api(&lua, draw_commands)?;
         register_config_api(&lua, config)?;
+        keyboard::register(&lua, keyboard)?;
 
         let source = fs::read_to_string(script_path).map_err(mlua::Error::external)?;
         execution::set_deadline(&deadline, Some(START_BUDGET));
@@ -273,6 +283,7 @@ impl LuaRuntime {
             Arc::clone(&self.control),
             Arc::clone(&self.draw_commands),
             Arc::clone(&self.config),
+            Arc::clone(&self.keyboard),
         ) {
             Ok((new_lua, new_deadline)) => {
                 if let Err(error) = execution::call_budgeted(
@@ -1034,6 +1045,42 @@ fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
                     addresses.push(addr);
                 }
                 crate::sync_ipc::batch_read(pid, size, &addresses).map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
+
+    // memory.batch_write(pid, writes) -> {bool, ...}
+    // `writes` is an array of {address, data} tables; `data` is a byte
+    // table. All entries are applied in a single service round trip and a
+    // single kernel transition; the returned table holds one success flag
+    // per entry, in input order.
+    module.set(
+        "batch_write",
+        lua.create_function(
+            |lua, (pid, writes_table): (u64, mlua::Table)| -> mlua::Result<mlua::Table> {
+                let count = writes_table.len()? as usize;
+                if count == 0 || count > ks_core::protocol::MAX_BATCH_WRITE_ENTRIES {
+                    return Err(mlua::Error::runtime("batch_write expects 1-64 entries"));
+                }
+                let mut entries = Vec::with_capacity(count);
+                for i in 1..=count {
+                    let item: mlua::Table = writes_table.get(i)?;
+                    let address: Address = item.get("address")?;
+                    let data: Vec<u8> = item.get("data")?;
+                    if data.is_empty() || data.len() > ks_core::protocol::MAX_DRIVER_TRANSFER_SIZE {
+                        return Err(mlua::Error::runtime(format!(
+                            "invalid batch_write data size at entry {i}"
+                        )));
+                    }
+                    entries.push((address.get(), data));
+                }
+                let flags =
+                    crate::sync_ipc::batch_write(pid, &entries).map_err(mlua::Error::runtime)?;
+                let result = lua.create_table()?;
+                for (i, ok) in flags.iter().enumerate() {
+                    result.set(i + 1, *ok)?;
+                }
+                Ok(result)
             },
         )?,
     )?;

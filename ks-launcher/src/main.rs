@@ -13,9 +13,190 @@ use std::time::Duration;
 use eframe::egui;
 use egui::FontFamily;
 
-const DRIVER_SERVICE: &str = "KsDriver";
-const BACKEND_SERVICE: &str = "KsService";
+const DEFAULT_DRIVER_FILE: &str = "ks-driver.sys";
+const DEFAULT_SERVICE_FILE: &str = "ks-service.exe";
+const DEFAULT_GUI_FILE: &str = "ks-gui.exe";
+const DEFAULT_DRIVER_SERVICE: &str = "KsDriver";
+const DEFAULT_BACKEND_SERVICE: &str = "KsService";
+const STATE_FILE: &str = "ks-launcher.state";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Random per-run identities. Each component's file is renamed to a fresh
+/// random name when its Start button is clicked, and renamed back to the
+/// canonical name once that component stops. Every service creation also
+/// registers a fresh random SCM name. Everything is recorded in a small
+/// state file so stop/cleanup keeps working across launcher restarts.
+#[derive(Clone)]
+struct LaunchNames {
+    driver_file: String,
+    service_file: String,
+    gui_file: String,
+    driver: String,
+    service: String,
+}
+
+impl LaunchNames {
+    fn load(base_dir: &Path) -> Self {
+        let mut names = Self {
+            driver_file: DEFAULT_DRIVER_FILE.to_owned(),
+            service_file: DEFAULT_SERVICE_FILE.to_owned(),
+            gui_file: DEFAULT_GUI_FILE.to_owned(),
+            driver: DEFAULT_DRIVER_SERVICE.to_owned(),
+            service: DEFAULT_BACKEND_SERVICE.to_owned(),
+        };
+        let Ok(text) = std::fs::read_to_string(base_dir.join(STATE_FILE)) else {
+            return names;
+        };
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !is_valid_name(value) {
+                continue;
+            }
+            match key {
+                "driver_file" => names.driver_file = value.to_owned(),
+                "service_file" => names.service_file = value.to_owned(),
+                "gui_file" => names.gui_file = value.to_owned(),
+                "driver" => names.driver = value.to_owned(),
+                "service" => names.service = value.to_owned(),
+                _ => {}
+            }
+        }
+        names
+    }
+
+    fn save(&self, base_dir: &Path) {
+        let text = format!(
+            "driver_file={}\nservice_file={}\ngui_file={}\ndriver={}\nservice={}\n",
+            self.driver_file, self.service_file, self.gui_file, self.driver, self.service
+        );
+        if let Err(error) = std::fs::write(base_dir.join(STATE_FILE), text) {
+            eprintln!("failed to write {STATE_FILE}: {error}");
+        }
+    }
+}
+
+/// Eight lowercase alphanumeric characters; a neutral name with no
+/// project-identifying prefix, valid as both a file stem and an SCM name.
+fn random_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut state =
+        nanos ^ ((std::process::id() as u64) << 32) ^ nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if state == 0 {
+        state = 0x853C_49E6_748F_EA9B;
+    }
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut token = String::with_capacity(8);
+    for _ in 0..8 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        token.push(ALPHABET[(state >> 33) as usize % ALPHABET.len()] as char);
+    }
+    token
+}
+
+fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// Renames one component file to a fresh random name. The recorded state
+/// name wins when it still exists on disk (already renamed), otherwise the
+/// canonical default name is used. A rename failure (file locked by a loaded
+/// driver or a running process) keeps the current name.
+fn rename_component(
+    base_dir: &Path,
+    recorded: &mut String,
+    default_name: &str,
+    extension: &str,
+    running: bool,
+    log: &Arc<Mutex<File>>,
+) {
+    let current = if base_dir.join(recorded.as_str()).is_file() {
+        recorded.clone()
+    } else if base_dir.join(default_name).is_file() {
+        default_name.to_owned()
+    } else {
+        write_log(log, format!("note: {default_name} not found"));
+        return;
+    };
+    if running {
+        write_log(log, format!("{current} is running; keeping its name"));
+        *recorded = current;
+        return;
+    }
+    for _ in 0..8 {
+        let candidate = format!("{}.{}", random_token(), extension);
+        if base_dir.join(&candidate).exists() {
+            continue;
+        }
+        match std::fs::rename(base_dir.join(&current), base_dir.join(&candidate)) {
+            Ok(()) => {
+                write_log(log, format!("renamed {current} -> {candidate}"));
+                *recorded = candidate;
+            }
+            Err(error) => {
+                write_log(
+                    log,
+                    format!("[warning] rename {current} failed: {error}; keeping its name"),
+                );
+                *recorded = current;
+            }
+        }
+        return;
+    }
+    *recorded = current;
+}
+
+/// Restores the canonical file names after their component has stopped.
+fn restore_component(
+    base_dir: &Path,
+    recorded: &mut String,
+    default_name: &str,
+    log: &Arc<Mutex<File>>,
+) {
+    if *recorded == default_name {
+        return;
+    }
+    let current = base_dir.join(recorded.as_str());
+    if !current.is_file() {
+        // The random-named file is gone; drop the stale name from the state.
+        write_log(
+            log,
+            format!("note: {recorded} missing; recording {default_name}"),
+        );
+        *recorded = default_name.to_owned();
+        return;
+    }
+    let target = base_dir.join(default_name);
+    if target.exists() {
+        write_log(
+            log,
+            format!("[warning] cannot restore {default_name}: already exists"),
+        );
+        return;
+    }
+    match std::fs::rename(&current, &target) {
+        Ok(()) => {
+            write_log(log, format!("restored {} -> {default_name}", *recorded));
+            *recorded = default_name.to_owned();
+        }
+        Err(error) => {
+            write_log(
+                log,
+                format!("[warning] restore {default_name} failed: {error}"),
+            );
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LaunchState {
@@ -44,10 +225,12 @@ struct LauncherApp {
     log: Arc<Mutex<File>>,
     events: Receiver<LaunchEvent>,
     event_tx: Sender<LaunchEvent>,
+    names: LaunchNames,
     driver: LaunchState,
     service: LaunchState,
     gui: LaunchState,
     busy: bool,
+    last_restore_attempt: Option<std::time::Instant>,
 }
 
 impl LauncherApp {
@@ -63,22 +246,21 @@ impl LauncherApp {
             .open(&log_path)
             .unwrap_or_else(|error| panic!("cannot open {}: {error}", log_path.display()));
         let (event_tx, events) = channel();
+        let names = LaunchNames::load(&base_dir);
         let mut app = Self {
             base_dir,
             log: Arc::new(Mutex::new(log)),
             events,
             event_tx,
+            names,
             driver: LaunchState::Unknown,
             service: LaunchState::Unknown,
             gui: LaunchState::Unknown,
             busy: false,
+            last_restore_attempt: None,
         };
         app.log("launcher started");
         app.log(format!("launcher directory: {}", app.base_dir.display()));
-        app.log(format!(
-            "driver path: {}",
-            app.base_dir.join("ks-driver.sys").display()
-        ));
         app.refresh_states();
         app
     }
@@ -91,9 +273,9 @@ impl LauncherApp {
     }
 
     fn refresh_states(&mut self) {
-        self.driver = service_state(DRIVER_SERVICE);
-        self.service = service_state(BACKEND_SERVICE);
-        self.gui = process_state("ks-gui.exe");
+        self.driver = service_state(&self.names.driver);
+        self.service = service_state(&self.names.service);
+        self.gui = process_state(&self.names.gui_file);
     }
 
     fn state_mut(&mut self, target: Target) -> &mut LaunchState {
@@ -113,12 +295,14 @@ impl LauncherApp {
         let base_dir = self.base_dir.clone();
         let log = Arc::clone(&self.log);
         let events = self.event_tx.clone();
+        let names = self.names.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
+            let mut names = names;
             let result = match target {
-                Target::Driver => start_driver(&base_dir, &log),
-                Target::Service => start_service(&base_dir, &log),
-                Target::Gui => start_gui(&base_dir, &log),
+                Target::Driver => start_driver(&base_dir, &log, &mut names),
+                Target::Service => start_service(&base_dir, &log, &mut names),
+                Target::Gui => start_gui(&base_dir, &log, &mut names),
             };
             let (state, message) = match result {
                 Ok(message) => (LaunchState::Running, message),
@@ -129,10 +313,18 @@ impl LauncherApp {
                 state,
                 message,
             });
+            // The start helpers persisted fresh random SCM names; query the
+            // state with the reloaded names, not the stale pre-start clone.
+            let fresh = LaunchNames::load(&base_dir);
+            let refreshed = match target {
+                Target::Driver => service_state(&fresh.driver),
+                Target::Service => service_state(&fresh.service),
+                Target::Gui => process_state(&fresh.gui_file),
+            };
             events
                 .send(LaunchEvent {
                     target,
-                    state: service_or_process_state(target),
+                    state: refreshed,
                     message: "state refreshed".to_owned(),
                 })
                 .ok();
@@ -148,12 +340,13 @@ impl LauncherApp {
         *self.state_mut(target) = LaunchState::Starting;
         let log = Arc::clone(&self.log);
         let events = self.event_tx.clone();
+        let names = self.names.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
             let result = match target {
-                Target::Driver => stop_service(DRIVER_SERVICE, &log),
-                Target::Service => stop_service(BACKEND_SERVICE, &log),
-                Target::Gui => stop_gui(&log),
+                Target::Driver => stop_service(&names.driver, &log),
+                Target::Service => stop_service(&names.service, &log),
+                Target::Gui => stop_gui(&names.gui_file, &log),
             };
             let (state, message) = match result {
                 Ok(message) => (LaunchState::Stopped, message),
@@ -209,12 +402,65 @@ impl LauncherApp {
     }
 
     fn update_events(&mut self) {
+        let mut processed = false;
         while let Ok(event) = self.events.try_recv() {
             self.log(format!("{:?}: {}", event.target, event.message));
             *self.state_mut(event.target) = event.state;
             if event.state != LaunchState::Starting {
                 self.busy = false;
             }
+            processed = true;
+        }
+        // start_driver/start_service persist fresh random SCM names and file
+        // names; reload them so later state queries and stop/cleanup address
+        // the new registrations instead of the names this session started
+        // with.
+        if processed {
+            self.names = LaunchNames::load(&self.base_dir);
+        }
+    }
+
+    /// Renames the random component file back to the canonical name once its
+    /// component has stopped. Retried at most once per second until it
+    /// succeeds (a driver image can stay locked for a short moment after the
+    /// service reports STOPPED).
+    fn maybe_restore_file_names(&mut self) {
+        if self.busy {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_restore_attempt {
+            if now.duration_since(last) < Duration::from_secs(1) {
+                return;
+            }
+        }
+        let mut touched = false;
+        let attempts = [
+            (
+                self.driver == LaunchState::Stopped,
+                &mut self.names.driver_file,
+                DEFAULT_DRIVER_FILE,
+            ),
+            (
+                self.service == LaunchState::Stopped,
+                &mut self.names.service_file,
+                DEFAULT_SERVICE_FILE,
+            ),
+            (
+                self.gui == LaunchState::Stopped,
+                &mut self.names.gui_file,
+                DEFAULT_GUI_FILE,
+            ),
+        ];
+        for (stopped, recorded, default_name) in attempts {
+            if stopped && recorded != default_name {
+                restore_component(&self.base_dir, recorded, default_name, &self.log);
+                touched = true;
+            }
+        }
+        if touched {
+            self.last_restore_attempt = Some(now);
+            self.names.save(&self.base_dir);
         }
     }
 }
@@ -222,6 +468,7 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_events();
+        self.maybe_restore_file_names();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
@@ -307,51 +554,92 @@ fn launch_button(
     response
 }
 
-fn start_driver(base_dir: &Path, log: &Arc<Mutex<File>>) -> Result<String, String> {
-    let path = base_dir.join("ks-driver.sys");
+fn start_driver(
+    base_dir: &Path,
+    log: &Arc<Mutex<File>>,
+    names: &mut LaunchNames,
+) -> Result<String, String> {
+    // Rename the file to a fresh random name for this run before the service
+    // registration references it.
+    rename_component(
+        base_dir,
+        &mut names.driver_file,
+        DEFAULT_DRIVER_FILE,
+        "sys",
+        false,
+        log,
+    );
+    names.save(base_dir);
+    let path = base_dir.join(&names.driver_file);
     if !path.is_file() {
         return Err(format!("driver file not found: {}", path.display()));
     }
+    // Every creation uses a fresh random SCM name; the previous registration
+    // (recorded in the state file) is deleted first, and the new name is
+    // persisted before `sc create` so a crash cannot orphan it.
+    let service_name = random_token();
+    let mut updated = names.clone();
+    updated.driver = service_name.clone();
+    updated.save(base_dir);
     // Command arguments already preserve the path as one value. Do not embed
     // quote characters in the value: SCM would store those quotes in ImagePath
     // instead of normalizing it to the native \??\ path form.
     let image_path = path.to_string_lossy().into_owned();
-    if service_state(DRIVER_SERVICE) != LaunchState::Running {
-        delete_service_if_present(DRIVER_SERVICE, log);
-        run_sc(
-            log,
-            &[
-                "create",
-                DRIVER_SERVICE,
-                "type=",
-                "kernel",
-                "start=",
-                "demand",
-                "binPath=",
-                &image_path,
-            ],
-        )?;
-        run_sc(log, &["start", DRIVER_SERVICE])?;
-    }
-    if service_state(DRIVER_SERVICE) != LaunchState::Running {
+    delete_service_if_present(&names.driver, log);
+    run_sc(
+        log,
+        &[
+            "create",
+            &service_name,
+            "type=",
+            "kernel",
+            "start=",
+            "demand",
+            "binPath=",
+            &image_path,
+        ],
+    )?;
+    run_sc(log, &["start", &service_name])?;
+    if !wait_for_running(&service_name) {
         return Err("driver did not reach RUNNING state".to_owned());
     }
-    Ok("driver started".to_owned())
+    Ok(format!("driver started as {service_name}"))
 }
 
-fn start_service(base_dir: &Path, log: &Arc<Mutex<File>>) -> Result<String, String> {
-    let path = base_dir.join("ks-service.exe");
+fn start_service(
+    base_dir: &Path,
+    log: &Arc<Mutex<File>>,
+    names: &mut LaunchNames,
+) -> Result<String, String> {
+    // Rename the file to a fresh random name for this run before the service
+    // registration references it.
+    rename_component(
+        base_dir,
+        &mut names.service_file,
+        DEFAULT_SERVICE_FILE,
+        "exe",
+        false,
+        log,
+    );
+    names.save(base_dir);
+    let path = base_dir.join(&names.service_file);
     if !path.is_file() {
         return Err(format!("service file not found: {}", path.display()));
     }
-    if service_state(BACKEND_SERVICE) != LaunchState::Running {
-        let quoted = format!("\"{}\"", path.display());
-        delete_service_if_present(BACKEND_SERVICE, log);
+    let service_name = random_token();
+    let mut updated = names.clone();
+    updated.service = service_name.clone();
+    updated.save(base_dir);
+    if service_state(&service_name) != LaunchState::Running {
+        // The registered SCM name must match the name the windows-service
+        // dispatcher expects, so it is passed to the binary through binPath.
+        let quoted = format!("\"{}\" --service-name {}", path.display(), service_name);
+        delete_service_if_present(&names.service, log);
         run_sc(
             log,
             &[
                 "create",
-                BACKEND_SERVICE,
+                &service_name,
                 "type=",
                 "own",
                 "start=",
@@ -362,17 +650,46 @@ fn start_service(base_dir: &Path, log: &Arc<Mutex<File>>) -> Result<String, Stri
                 &quoted,
             ],
         )?;
-        run_sc(log, &["sidtype", BACKEND_SERVICE, "unrestricted"])?;
-        run_sc(log, &["start", BACKEND_SERVICE])?;
+        run_sc(log, &["sidtype", &service_name, "unrestricted"])?;
+        run_sc(log, &["start", &service_name])?;
     }
-    if service_state(BACKEND_SERVICE) != LaunchState::Running {
+    if !wait_for_running(&service_name) {
         return Err("backend service did not reach RUNNING state".to_owned());
     }
-    Ok("service started".to_owned())
+    Ok(format!("service started as {service_name}"))
 }
 
-fn start_gui(base_dir: &Path, log: &Arc<Mutex<File>>) -> Result<String, String> {
-    let path = base_dir.join("ks-gui.exe");
+/// `sc start` returns while the service is still START_PENDING; poll until it
+/// reaches RUNNING (about 3s at most) so the reported state is final.
+fn wait_for_running(name: &str) -> bool {
+    for _ in 0..30 {
+        match service_state(name) {
+            LaunchState::Running => return true,
+            LaunchState::Starting => thread::sleep(Duration::from_millis(100)),
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn start_gui(
+    base_dir: &Path,
+    log: &Arc<Mutex<File>>,
+    names: &mut LaunchNames,
+) -> Result<String, String> {
+    // Rename the file to a fresh random name for this run. The Start button
+    // is only enabled while the GUI is not running, so the rename cannot hit
+    // a live process image.
+    rename_component(
+        base_dir,
+        &mut names.gui_file,
+        DEFAULT_GUI_FILE,
+        "exe",
+        false,
+        log,
+    );
+    names.save(base_dir);
+    let path = base_dir.join(&names.gui_file);
     if !path.is_file() {
         return Err(format!("GUI file not found: {}", path.display()));
     }
@@ -405,10 +722,10 @@ fn delete_service_if_present(name: &str, log: &Arc<Mutex<File>>) {
     }
 }
 
-fn stop_gui(log: &Arc<Mutex<File>>) -> Result<String, String> {
-    write_log(log, "> taskkill /IM ks-gui.exe /T");
+fn stop_gui(image_name: &str, log: &Arc<Mutex<File>>) -> Result<String, String> {
+    write_log(log, format!("> taskkill /IM {image_name} /T"));
     let output = Command::new("taskkill")
-        .args(["/IM", "ks-gui.exe", "/T"])
+        .args(["/IM", image_name, "/T"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("failed to run taskkill: {error}"))?;
@@ -485,14 +802,6 @@ fn process_state(name: &str) -> LaunchState {
         }
         Ok(_) => LaunchState::Stopped,
         Err(_) => LaunchState::Unknown,
-    }
-}
-
-fn service_or_process_state(target: Target) -> LaunchState {
-    match target {
-        Target::Driver => service_state(DRIVER_SERVICE),
-        Target::Service => service_state(BACKEND_SERVICE),
-        Target::Gui => process_state("ks-gui.exe"),
     }
 }
 

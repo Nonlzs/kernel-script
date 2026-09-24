@@ -27,21 +27,48 @@ fn main() {
     if std::env::args().any(|arg| arg == "--console") {
         tracing::info!("service console mode starting");
         run_console();
-    } else if let Err(error) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
-        tracing::error!(%error, "service dispatcher failed; use --console for interactive mode");
+    } else {
+        let name = service_name_from_args();
+        tracing::info!(%name, "service dispatcher starting");
+        if let Err(error) = service_dispatcher::start(&name, ffi_service_main) {
+            tracing::error!(%error, "service dispatcher failed; use --console for interactive mode");
+        }
     }
 }
 
+/// The launcher registers this binary under a random per-launch SCM name and
+/// passes it here through binPath. The windows-service dispatcher refuses to
+/// start unless the name matches the SCM registration, so every entry point
+/// resolves the name the same way.
+fn service_name_from_args() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(name) = arg.strip_prefix("--service-name=") {
+            if !name.is_empty() {
+                return name.to_owned();
+            }
+        }
+        if arg == "--service-name" {
+            if let Some(name) = args.get(index + 1) {
+                if !name.is_empty() {
+                    return name.clone();
+                }
+            }
+        }
+    }
+    SERVICE_NAME.to_owned()
+}
+
 fn service_main(_arguments: Vec<OsString>) {
-    if let Err(error) = run_windows_service() {
+    if let Err(error) = run_windows_service(&service_name_from_args()) {
         tracing::error!(%error, "service failed");
     }
 }
 
-fn run_windows_service() -> Result<(), windows_service::Error> {
+fn run_windows_service(name: &str) -> Result<(), windows_service::Error> {
     let (stop_tx, stop_rx) = broadcast::channel(2);
     let status_handle: ServiceStatusHandle =
-        service_control_handler::register(SERVICE_NAME, move |control| match control {
+        service_control_handler::register(name, move |control| match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 let _ = stop_tx.send(());
                 ServiceControlHandlerResult::NoError

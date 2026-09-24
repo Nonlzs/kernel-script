@@ -23,8 +23,9 @@ end
 说明：
 
 - `OnStart` 在脚本加载后调用一次。
-- `OnUpdate` 是唯一的每帧回调。覆盖层帧率封顶 100Hz。
+- `OnUpdate` 是唯一的每帧回调。覆盖层帧率封顶 60Hz。
 - UI 和 draw API 都在 `OnUpdate` 中使用。
+- 键盘状态在每帧 `OnUpdate` 之前快照一次；同帧内查询与按下沿锁存保持一致。
 - `OnDestroy` 在热重载或 GUI 退出时调用。
 - 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
 - 如果延迟敏感，不要在 `ui.window` 回调中调用内存 API。
@@ -192,22 +193,65 @@ config.save()
 - 写入经过防抖（每秒最多一次）且为原子操作（临时文件 + 重命名）；崩溃
   不会留下半写的文件。
 
+## Keyboard Input API（键盘输入）
+
+键盘查询读取整个桌面的物理按键状态（`GetAsyncKeyState`），即使其他窗口
+（游戏）持有输入焦点也有效。引擎每帧对所有按键做一次快照；`is_key_press`
+报告自上一帧以来的按下沿（检测粒度为一帧，60Hz）。
+
+`key` 接受按键名或原始虚拟键码（整数 0–255）。支持的名称：`"a"`–`"z"`、
+`"0"`–`"9"`、`"f1"`–`"f24"`、`"space"`、`"tab"`、`"enter"`/`"return"`、
+`"backspace"`/`"back"`、`"escape"`/`"esc"`、`"shift"`/`"lshift"`/
+`"rshift"`、`"ctrl"`/`"lctrl"`/`"rctrl"`、`"alt"`/`"lalt"`/`"ralt"`、
+`"insert"`/`"ins"`、`"delete"`/`"del"`、`"home"`、`"end"`、`"pageup"`、
+`"pagedown"`、`"up"`、`"down"`、`"left"`、`"right"`、`"capslock"`、
+`"pause"`、`"lwin"`、`"rwin"`、`"numpad0"`–`"numpad9"`、`"multiply"`、
+`"add"`、`"subtract"`、`"divide"`、`"decimal"`，以及鼠标键
+`"mouse1"`–`"mouse5"`（同义 `"lbutton"`、`"rbutton"`、`"mbutton"`、
+`"xbutton1"`、`"xbutton2"`）。
+
+### keyboard.is_key_down
+
+```lua
+if keyboard.is_key_down("f") then
+    -- 当前按住
+end
+```
+
+### keyboard.is_key_up
+
+```lua
+if keyboard.is_key_up("shift") then
+    -- 未按住
+end
+```
+
+### keyboard.is_key_press
+
+当自上次调用以来观察到一次完整的**按下并回弹**周期时返回 true。标志跨帧
+锁存，**读取即清除**——单次按键只触发一次，适合做开关切换。
+
+```lua
+if keyboard.is_key_press("mouse2") then
+    aimbot_enabled = not aimbot_enabled
+end
+```
+
 ## Memory Lock API（内存锁定）
 
 Memory lock 维护一个周期性写入，以驱动往返允许的速度持续向目标地址重写指定
 字节模式。锁以 `(pid, absolute_address)` 复合键标识，对同一键重复 lock 会
 更新数据而不创建重复条目。
 
-锁表位于 `ks-service`：专用重写线程以纯自旋方式将每条锁通过普通写入路径
-（`IOCTL_WRITE_MEMORY`）连续重放——sweep 之间无间隔，仅由 IOCTL 往返耗时
-决定频率（每秒数万次，占用一个核心）。Driver 不保存任何锁状态。锁表最多
-64 条，每条 1–4096 字节。所有写入与普通 `memory.write_*` 使用完全相同的
-内核原语。
+锁表位于 `ks-service`：专用重写线程以连续自旋将每条锁通过一次批量写
+（`IOCTL_WRITE_MEMORY_BATCH`）重放。Driver 不
+保存任何锁状态。锁表最多 64 条，每条 1–4096 字节。
+所有写入与普通 `memory.write_*` 使用完全相同的内核原语。
 
 ### memory.lock
 
-将字节模式锁定到绝对地址。Service 以纯自旋方式持续将 `data` 写入目标进程的
-`address`，直到 unlock。
+将字节模式锁定到绝对地址。Service 持续将 `data` 写入目标进程的 `address`，
+直到 unlock。
 
 ```lua
 memory.lock(pid, address, {0x90, 0x90, 0x90, 0xC3})
@@ -348,6 +392,29 @@ print(addr)
 
 **最大偏移数**：每次调用最多 32 个。如果链中任何指针为 null 或不可读，
 则返回 `0`。
+
+## Batch Write API（批量写入）
+
+### memory.batch_write
+
+在单次 service 往返和单次内核转换（`IOCTL_WRITE_MEMORY_BATCH`）内应用多条
+写入：整批只做一次进程查找，每条写入返回一个 NTSTATUS。
+
+```lua
+local results = memory.batch_write(pid, {
+    { address = "0x7FF812345000", data = {0x90, 0x90} },
+    { address = "0x7FF812345100", data = {1, 2, 3, 4} },
+    { address = base + offset,    data = {0xE9} },
+})
+-- results[i] 为 true 表示第 i 条写入成功
+```
+
+约束：
+
+- 每次调用 1–64 条（`MAX_BATCH_WRITE_ENTRIES`）。
+- 每条 `data` 为 1–4096 字节。
+- `address` 接受与其他内存 API 相同的形式（十进制数字或十六进制字符串）。
+- 条目按输入顺序执行；某条失败不影响后续条目。
 
 ### 示例：零分配实体扫描
 
@@ -695,7 +762,8 @@ GUI 到 service 的 IPC 使用同步阻塞 Named Pipe 调用：
 - 所有内存 API 调用都是同步的，阻塞 Lua 线程约 60-100μs。
 - 单次内存读写最多 4096 字节。
 - 批量读取限制：最多 256 个条目，总计 4096 字节。
-- 内存锁限制：64 条，每条最多 4096 字节，10ms 写入间隔。
+- 内存锁限制：64 条，每条最多 4096 字节；连续自旋重放，每轮 sweep 一次
+  批量写 IOCTL。
 - 进程列表由 service 在用户态枚举。
 - 内存读写和 RVA 计算由 driver 执行。
 - 窗口枚举在 GUI 进程（用户会话）中执行。
